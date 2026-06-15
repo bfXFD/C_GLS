@@ -1,0 +1,31 @@
+config = dict(
+    seed=0,
+    primary_device="cuda:0",
+    dataset=dict(
+        basedir="./data/TUM_RGBD",
+        gradslam_data_cfg="./configs/data/TUM/freiburg1_desk.yaml",
+        sequence="rgbd_dataset_freiburg1_desk",
+        desired_image_height=480,
+        desired_image_width=640,
+        start=0,
+        end=-1,
+        stride=1,
+        depth_min=0.0,
+        depth_max=4.0,
+        max_points=10000,
+    ),
+    registration=dict(
+        backend="numpy_point_to_point",
+        voxel_size=None,
+        max_correspondence_distance=0.07,
+        max_iterations=30,
+        normal_radius=0.10,
+        normal_max_nn=30,
+        init_mode="previous_estimate",
+    ),
+    eval=dict(
+        align_ate=True,
+        rpe_delta=1,
+        save_tum_format=True,
+    ),
+)
