@@ -89,32 +89,64 @@ def compute_and_save_fisher(
         "source_path": np.asarray(source_path),
         "original_num_points": np.asarray(original_num_points, dtype=np.int64),
         "sample_indices": np.asarray([], dtype=np.int64) if sample_indices is None else sample_indices,
+        "fisher_sample_size": np.asarray(points.shape[0], dtype=np.int64),
     }
 
     if retained_indices is not None:
         retained_indices_for_fisher = np.asarray(retained_indices, dtype=np.int64)
+        sample_retained_count = retained_indices_for_fisher.size
+        sample_pruned_count = original_num_points - retained_indices_for_fisher.size
         if sample_indices is not None:
             retained_indices_for_fisher = np.flatnonzero(retained_mask_sample).astype(np.int64)
+            sample_retained_count = retained_indices_for_fisher.size
+            sample_pruned_count = int(sample_indices.size - retained_indices_for_fisher.size)
             if retained_indices_for_fisher.size == 0:
                 raise ValueError("No retained indices are present in the Fisher point subsample")
-        residuals = compute_pruning_residuals(fisher["per_gaussian_fim"], retained_indices_for_fisher)
-        prediction = predict_error_increment(
-            residuals["full_fim"], residuals["pruned_fim"], regularization=regularization
-        )
+        residual_valid = bool(sample_pruned_count > 0)
+        if residual_valid:
+            residuals = compute_pruning_residuals(fisher["per_gaussian_fim"], retained_indices_for_fisher)
+            prediction = predict_error_increment(
+                residuals["full_fim"], residuals["pruned_fim"], regularization=regularization
+            )
+            pruned_indices = residuals["pruned_indices"].astype(np.int64)
+            retained_fim = residuals["retained_fim"].astype(np.float32)
+            pruned_fim = residuals["pruned_fim"].astype(np.float32)
+            delta_trace = residuals["delta_trace"]
+            delta_spectral = residuals["delta_spectral"]
+            trace_inv_full = prediction["trace_inv_full"]
+            pred_delta_trace = prediction["pred_delta_trace"]
+            pred_delta_spectral = prediction["pred_delta_spectral"]
+            valid_trace_bound = prediction["valid_trace_bound"]
+            valid_spectral_bound = prediction["valid_spectral_bound"]
+        else:
+            pruned_indices = np.asarray([], dtype=np.int64)
+            retained_fim = fisher["full_fim"].astype(np.float32)
+            pruned_fim = np.zeros((6, 6), dtype=np.float32)
+            delta_trace = np.nan
+            delta_spectral = np.nan
+            trace_inv_full = np.nan
+            pred_delta_trace = np.nan
+            pred_delta_spectral = np.nan
+            valid_trace_bound = False
+            valid_spectral_bound = False
         output.update(
             {
                 "retained_indices": retained_indices_for_fisher.astype(np.int64),
                 "original_retained_indices": np.asarray(retained_indices, dtype=np.int64),
-                "pruned_indices": residuals["pruned_indices"].astype(np.int64),
-                "retained_fim": residuals["retained_fim"].astype(np.float32),
-                "pruned_fim": residuals["pruned_fim"].astype(np.float32),
-                "delta_trace": np.asarray(residuals["delta_trace"], dtype=np.float32),
-                "delta_spectral": np.asarray(residuals["delta_spectral"], dtype=np.float32),
-                "trace_inv_full": np.asarray(prediction["trace_inv_full"], dtype=np.float32),
-                "pred_delta_trace": np.asarray(prediction["pred_delta_trace"], dtype=np.float32),
-                "pred_delta_spectral": np.asarray(prediction["pred_delta_spectral"], dtype=np.float32),
-                "valid_trace_bound": np.asarray(prediction["valid_trace_bound"]),
-                "valid_spectral_bound": np.asarray(prediction["valid_spectral_bound"]),
+                "pruned_indices": pruned_indices,
+                "retained_fim": retained_fim,
+                "pruned_fim": pruned_fim,
+                "delta_trace": np.asarray(delta_trace, dtype=np.float32),
+                "delta_spectral": np.asarray(delta_spectral, dtype=np.float32),
+                "trace_inv_full": np.asarray(trace_inv_full, dtype=np.float32),
+                "pred_delta_trace": np.asarray(pred_delta_trace, dtype=np.float32),
+                "pred_delta_spectral": np.asarray(pred_delta_spectral, dtype=np.float32),
+                "valid_trace_bound": np.asarray(valid_trace_bound),
+                "valid_spectral_bound": np.asarray(valid_spectral_bound),
+                "residual_valid": np.asarray(residual_valid),
+                "sample_retained_count": np.asarray(sample_retained_count, dtype=np.int64),
+                "sample_pruned_count": np.asarray(sample_pruned_count, dtype=np.int64),
+                "sample_retained_ratio": np.asarray(sample_retained_count / points.shape[0], dtype=np.float32),
             }
         )
 

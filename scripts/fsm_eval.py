@@ -32,6 +32,9 @@ SUMMARY_ALL_FIELDS = [
     "delta_spectral",
     "trace_inv_full",
     "pred_delta",
+    "residual_valid",
+    "sample_retained_count",
+    "sample_pruned_count",
     "ate_rmse",
     "rpe_rmse",
     "fitness",
@@ -71,6 +74,7 @@ def parse_args():
     parser.add_argument("--skip-existing", action="store_true", help="Skip localization tasks with existing summary.json.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite exported map variant directories.")
     parser.add_argument("--fisher-max-points", type=int, default=200000, help="Deterministic point subsample used for Fisher on large maps.")
+    parser.add_argument("--fisher-seed", type=int, default=None, help="Seed for Fisher subsampling. Defaults to config seed + 10007.")
     return parser.parse_args()
 
 
@@ -143,6 +147,9 @@ def empty_summary_row(
         "delta_spectral": "",
         "trace_inv_full": "",
         "pred_delta": "",
+        "residual_valid": "",
+        "sample_retained_count": "",
+        "sample_pruned_count": "",
         "ate_rmse": "",
         "rpe_rmse": "",
         "fitness": "",
@@ -188,6 +195,9 @@ def _summary_from_outputs(
             "delta_spectral": _load_npz_scalar(fisher, "delta_spectral", ""),
             "trace_inv_full": _load_npz_scalar(fisher, "trace_inv_full", ""),
             "pred_delta": _load_npz_scalar(fisher, "pred_delta_spectral", ""),
+            "residual_valid": _load_npz_scalar(fisher, "residual_valid", ""),
+            "sample_retained_count": _load_npz_scalar(fisher, "sample_retained_count", ""),
+            "sample_pruned_count": _load_npz_scalar(fisher, "sample_pruned_count", ""),
             "ate_rmse": localize_summary.get("ate_rmse", ""),
             "rpe_rmse": localize_summary.get("rpe_trans_rmse", ""),
             "latency_mean_ms": localize_summary.get("latency_mean_ms", ""),
@@ -217,10 +227,12 @@ def run_eval(
     skip_existing: bool = False,
     overwrite: bool = False,
     fisher_max_points: int | None = 200000,
+    fisher_seed: int | None = None,
 ) -> dict[str, Any]:
     config = load_config(config_path)
     strategies = strategies or config.get("fsm", {}).get("strategies", ["full"])
     compression_ratios = compression_ratios or config.get("fsm", {}).get("compression_ratios", [1.0])
+    fisher_seed = int(config.get("seed", 0)) + 10007 if fisher_seed is None else int(fisher_seed)
 
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -249,7 +261,7 @@ def run_eval(
         str(fisher_full_path),
         params_path=params_path,
         max_points=fisher_max_points,
-        seed=int(config.get("seed", 0)),
+        seed=fisher_seed,
     )
     print("[fsm_eval] loading dataset", flush=True)
     dataset = load_dataset_from_config(config_path)
@@ -277,7 +289,7 @@ def run_eval(
             params_path=params_path,
             retained_indices=np.load(task["map_path"], allow_pickle=True)["indices"],
             max_points=fisher_max_points,
-            seed=int(config.get("seed", 0)),
+            seed=fisher_seed,
         )
         summary_rows.append(
             _summary_from_outputs(
@@ -308,6 +320,7 @@ def main() -> None:
         skip_existing=args.skip_existing,
         overwrite=args.overwrite,
         fisher_max_points=args.fisher_max_points,
+        fisher_seed=args.fisher_seed,
     )
     mode = "planned" if result["dry_run"] else "completed"
     print(f"FSM eval {mode}: {len(result['tasks'])} tasks, output={args.output_dir}")

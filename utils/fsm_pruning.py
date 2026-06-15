@@ -13,6 +13,10 @@ SUPPORTED_STRATEGIES = (
     "scale_large",
     "uniform_stride",
     "external_scores",
+    "fisher_score",
+    "fisher_x_scale",
+    "fisher_x_opacity",
+    "fisher_x_scale_opacity",
 )
 
 
@@ -76,6 +80,38 @@ def score_scale_small(params: dict[str, Any]) -> np.ndarray:
 
 def score_scale_large(params: dict[str, Any]) -> np.ndarray:
     return _scale_magnitude(params)
+
+
+def _normalize_score(scores: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    scores = np.asarray(scores, dtype=np.float64)
+    if scores.ndim != 1:
+        raise ValueError(f"Expected scores with shape [N], got {scores.shape}")
+    if np.any(~np.isfinite(scores)):
+        raise ValueError("scores must be finite")
+    min_value = float(np.min(scores))
+    max_value = float(np.max(scores))
+    if max_value - min_value <= eps:
+        return np.ones_like(scores, dtype=np.float64)
+    return (scores - min_value) / (max_value - min_value + eps)
+
+
+def score_fisher_hybrid(
+    params: dict[str, Any],
+    fisher_scores: np.ndarray,
+    use_scale: bool = False,
+    use_opacity: bool = False,
+) -> np.ndarray:
+    num_items = _num_gaussians_from_params(params)
+    fisher_scores = np.asarray(fisher_scores, dtype=np.float64)
+    if fisher_scores.ndim != 1 or fisher_scores.shape[0] != num_items:
+        raise ValueError(f"Expected Fisher scores with shape [{num_items}], got {fisher_scores.shape}")
+
+    score = _normalize_score(fisher_scores) + 1e-12
+    if use_scale:
+        score *= 1.0 + _normalize_score(score_scale_large(params))
+    if use_opacity:
+        score *= 1.0 + _normalize_score(score_opacity(params))
+    return score.astype(np.float64)
 
 
 def select_random(num_items: int, k: int, seed: int = 0) -> np.ndarray:
@@ -160,12 +196,22 @@ def select_by_strategy(
     elif strategy == "scale_large":
         score_array = score_scale_large(params)
         indices = select_topk(score_array, k, largest=True)
-    else:
+    elif strategy == "external_scores":
         if scores is None:
             raise ValueError("scores must be provided when strategy='external_scores'")
         score_array = np.asarray(scores, dtype=np.float64)
         if score_array.ndim != 1 or score_array.shape[0] != num_items:
             raise ValueError(f"Expected external scores with shape [{num_items}], got {score_array.shape}")
+        indices = select_topk(score_array, k, largest=True)
+    else:
+        if scores is None:
+            raise ValueError(f"scores must be provided when strategy='{strategy}'")
+        score_array = score_fisher_hybrid(
+            params,
+            fisher_scores=scores,
+            use_scale=strategy in ("fisher_x_scale", "fisher_x_scale_opacity"),
+            use_opacity=strategy in ("fisher_x_opacity", "fisher_x_scale_opacity"),
+        )
         indices = select_topk(score_array, k, largest=True)
 
     return _validate_indices(indices, num_items), np.asarray(score_array, dtype=np.float64)

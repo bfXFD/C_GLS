@@ -139,6 +139,20 @@ def test_compute_and_save_fisher_with_retained_indices(tmp_path):
     np.testing.assert_array_equal(loaded["retained_indices"], retained)
     assert "delta_trace" in loaded
     assert "pred_delta_spectral" in loaded
+    assert bool(loaded["residual_valid"])
+    assert int(loaded["sample_retained_count"]) == retained.size
+    assert int(loaded["sample_pruned_count"]) == 5
+
+
+def test_compute_and_save_fisher_marks_residual_invalid_when_sample_has_no_pruned_points(tmp_path):
+    params_path, points = make_params_file(tmp_path)
+    output_path = tmp_path / "fisher_scores.npz"
+    retained = np.arange(points.shape[0], dtype=np.int64)
+    compute_and_save_fisher(str(output_path), params_path=str(params_path), retained_indices=retained, normal_k=4)
+    loaded = np.load(output_path, allow_pickle=True)
+    assert not bool(loaded["residual_valid"])
+    assert int(loaded["sample_pruned_count"]) == 0
+    assert np.isnan(float(loaded["delta_spectral"]))
 
 
 def test_compute_and_save_fisher_from_fsm_map(tmp_path):

@@ -95,6 +95,23 @@ def test_export_external_scores(tmp_path):
     np.testing.assert_array_equal(fsm_map["indices"], np.array([1, 3]))
 
 
+def test_export_fisher_hybrid_strategy_uses_external_scores(tmp_path):
+    params_path = make_params_file(tmp_path)
+    output_dir = tmp_path / "maps"
+    fisher_scores = np.array([1.0, 6.0, 2.0, 5.0, 3.0, 4.0], dtype=np.float32)
+    rows = export_fsm_maps(
+        params_path=str(params_path),
+        output_dir=str(output_dir),
+        strategies=["fisher_score", "fisher_x_scale"],
+        counts=[2],
+        external_scores=fisher_scores,
+    )
+    assert len(rows) == 2
+    fisher_map = load_fsm_map(rows[0]["map_path"])
+    np.testing.assert_array_equal(fisher_map["indices"], np.array([1, 3]))
+    assert (output_dir / "fisher_x_scale_count_2" / "fsm_map.npz").exists()
+
+
 def test_load_external_scores_from_npz_and_npy(tmp_path):
     scores = np.array([1.0, 2.0, 3.0])
     npz_path = tmp_path / "scores.npz"

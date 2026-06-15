@@ -4,6 +4,7 @@ import pytest
 from utils.fsm_pruning import (
     resolve_budget,
     score_opacity,
+    score_fisher_hybrid,
     score_scale_large,
     score_scale_small,
     select_by_strategy,
@@ -112,6 +113,29 @@ def test_select_by_external_scores():
     indices, scores = select_by_strategy(params, "external_scores", count=3, scores=external)
     np.testing.assert_array_equal(indices, np.array([1, 3, 2]))
     np.testing.assert_allclose(scores, external)
+
+
+def test_score_fisher_hybrid_combines_scale_and_opacity():
+    params = make_params()
+    fisher = np.array([1.0, 1.0, 1.0, 1.0, 1.0])
+    scores = score_fisher_hybrid(params, fisher, use_scale=True, use_opacity=True)
+    assert scores.shape == (5,)
+    assert np.argmax(scores) == 2
+
+
+def test_select_by_fisher_score_requires_scores_and_prefers_highest():
+    params = make_params()
+    fisher = np.array([0.0, 2.0, 5.0, 1.0, 4.0])
+    indices, scores = select_by_strategy(params, "fisher_score", count=2, scores=fisher)
+    np.testing.assert_array_equal(indices, np.array([2, 4]))
+    assert scores.shape == (5,)
+
+
+def test_select_by_fisher_x_scale_uses_hybrid_order():
+    params = make_params()
+    fisher = np.array([0.1, 1.0, 0.1, 0.1, 0.1])
+    indices, _ = select_by_strategy(params, "fisher_x_scale", count=1, scores=fisher)
+    np.testing.assert_array_equal(indices, np.array([1]))
 
 
 def test_select_by_external_scores_requires_scores():
