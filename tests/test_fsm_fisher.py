@@ -5,6 +5,7 @@ import sys
 import numpy as np
 import pytest
 
+from scripts.fsm_candidate_fisher import compute_candidate_fisher_scores
 from scripts.fsm_fisher import compute_and_save_fisher, load_retained_indices
 from utils.fsm_fisher import (
     compute_geometric_fisher,
@@ -128,6 +129,21 @@ def test_compute_and_save_fisher_from_params(tmp_path):
     assert loaded["scores"].shape == (points.shape[0],)
     assert loaded["full_fim"].shape == (6, 6)
     assert output["scores"].shape == (points.shape[0],)
+
+
+def test_compute_candidate_fisher_scores_writes_full_length_scores(tmp_path):
+    params_path, points = make_params_file(tmp_path)
+    output_path = tmp_path / "candidate_scores.npz"
+    output = compute_candidate_fisher_scores(
+        params_path=str(params_path),
+        output_path=str(output_path),
+        candidate_ratio=0.5,
+        normal_k=4,
+    )
+    assert output_path.exists()
+    assert output["scores"].shape == (points.shape[0],)
+    assert int(output["N_candidate"]) == 4
+    assert np.count_nonzero(output["scores"]) > 0
 
 
 def test_compute_and_save_fisher_with_retained_indices(tmp_path):

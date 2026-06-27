@@ -81,6 +81,7 @@ def test_run_eval_dry_run_writes_plan_and_summary_schema(tmp_path):
     assert summary_rows[0]["run_name"] == "run0"
     assert summary_rows[0]["backend"] == "numpy_point_to_point"
     assert summary_rows[0]["seed"] == "7"
+    assert "score_source" in summary_rows[0]
 
 
 def test_run_eval_dry_run_cli_overrides_strategies_and_ratios(tmp_path):
@@ -98,6 +99,23 @@ def test_run_eval_dry_run_cli_overrides_strategies_and_ratios(tmp_path):
     assert len(result["tasks"]) == 1
     assert result["tasks"][0]["strategy"] == "opacity"
     assert result["tasks"][0]["compression_ratio"] == "0.25"
+
+
+def test_run_eval_dry_run_accepts_external_score_args(tmp_path):
+    config_path = make_config_file(tmp_path)
+    params_path = make_params_file(tmp_path)
+    scores_path = tmp_path / "scores.npz"
+    np.savez(scores_path, scores=np.arange(4, dtype=np.float32))
+    result = run_eval(
+        str(config_path),
+        str(params_path),
+        str(tmp_path / "eval"),
+        strategies=["fisher_score"],
+        compression_ratios=[0.5],
+        dry_run=True,
+        external_scores_path=str(scores_path),
+    )
+    assert len(result["tasks"]) == 1
 
 
 def test_cli_dry_run_smoke(tmp_path):

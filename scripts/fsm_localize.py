@@ -122,6 +122,7 @@ def run_localization(
 ) -> dict[str, Any]:
     fsm_map = load_fsm_map(map_path)
     target_points = np.asarray(fsm_map["means"], dtype=np.float64)
+    target_covariances = np.asarray(fsm_map["covariances"], dtype=np.float64) if "covariances" in fsm_map else None
 
     if frames is None:
         if dataset is None:
@@ -178,6 +179,7 @@ def run_localization(
             max_iterations=int(registration_cfg.get("max_iterations", 30)),
             normal_radius=registration_cfg.get("normal_radius"),
             normal_max_nn=int(registration_cfg.get("normal_max_nn", 30)),
+            target_covariances=target_covariances,
         )
 
         fallback_used = False

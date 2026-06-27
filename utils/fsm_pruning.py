@@ -11,6 +11,15 @@ SUPPORTED_STRATEGIES = (
     "opacity",
     "scale_small",
     "scale_large",
+    "scale_x_opacity",
+    "voxel_grid_pure",
+    "voxel_grid",
+    "voxel_scale",
+    "voxel_scale_opacity",
+    "fps_pure",
+    "fps",
+    "fps_scale",
+    "fps_scale_opacity",
     "uniform_stride",
     "external_scores",
     "fisher_score",
@@ -82,6 +91,12 @@ def score_scale_large(params: dict[str, Any]) -> np.ndarray:
     return _scale_magnitude(params)
 
 
+def score_scale_opacity(params: dict[str, Any], scale_weight: float = 0.7, opacity_weight: float = 0.3) -> np.ndarray:
+    return float(scale_weight) * _normalize_score(score_scale_large(params)) + float(opacity_weight) * _normalize_score(
+        score_opacity(params)
+    )
+
+
 def _normalize_score(scores: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     scores = np.asarray(scores, dtype=np.float64)
     if scores.ndim != 1:
@@ -136,6 +151,105 @@ def select_uniform_stride(num_items: int, k: int) -> np.ndarray:
     return np.unique(indices).astype(np.int64)
 
 
+def _require_means(params: dict[str, Any]) -> np.ndarray:
+    if "means3D" not in params:
+        raise KeyError("Missing required field 'means3D' for spatial pruning")
+    means = np.asarray(params["means3D"], dtype=np.float64)
+    if means.ndim != 2 or means.shape[1] != 3:
+        raise ValueError(f"Expected means3D with shape [N, 3], got {means.shape}")
+    if np.any(~np.isfinite(means)):
+        raise ValueError("means3D must be finite")
+    return means
+
+
+def _fill_by_score(selected: np.ndarray, score_array: np.ndarray, k: int) -> np.ndarray:
+    selected = np.asarray(selected, dtype=np.int64)
+    score_array = np.asarray(score_array, dtype=np.float64)
+    if selected.size >= k:
+        return selected[:k].astype(np.int64)
+    mask = np.ones(score_array.shape[0], dtype=bool)
+    mask[selected] = False
+    fill_order = np.flatnonzero(mask)
+    fill = fill_order[np.argsort(-score_array[fill_order], kind="mergesort")[: k - selected.size]]
+    return np.concatenate([selected, fill]).astype(np.int64)
+
+
+def select_voxel_grid(params: dict[str, Any], k: int, fill_scores: np.ndarray | None = None) -> np.ndarray:
+    means = _require_means(params)
+    num_items = means.shape[0]
+    k = min(int(k), int(num_items))
+    if k <= 0:
+        raise ValueError("k must be positive")
+    if k == num_items:
+        return np.arange(num_items, dtype=np.int64)
+
+    span = np.ptp(means, axis=0)
+    positive_span = span[span > 0]
+    if positive_span.size == 0:
+        return np.arange(k, dtype=np.int64)
+
+    volume = float(np.prod(np.maximum(span, np.min(positive_span))))
+    voxel_size = max((volume / max(k, 1)) ** (1.0 / 3.0), 1e-12)
+    grid = np.floor((means - np.min(means, axis=0)) / voxel_size).astype(np.int64)
+    _, first_indices = np.unique(grid, axis=0, return_index=True)
+    selected = np.sort(first_indices.astype(np.int64))
+
+    if selected.size > k:
+        if fill_scores is None:
+            selected = selected[np.linspace(0, selected.size - 1, num=k, dtype=np.int64)]
+        else:
+            score_array = np.asarray(fill_scores, dtype=np.float64)
+            selected = selected[np.argsort(-score_array[selected], kind="mergesort")[:k]]
+    elif selected.size < k:
+        fill_score_array = np.arange(num_items, 0, -1, dtype=np.float64) if fill_scores is None else np.asarray(fill_scores, dtype=np.float64)
+        selected = _fill_by_score(selected, fill_score_array, k)
+    return np.asarray(selected, dtype=np.int64)
+
+
+def select_farthest_point(
+    params: dict[str, Any],
+    k: int,
+    seed: int = 0,
+    candidate_cap: int | None = None,
+    fill_scores: np.ndarray | None = None,
+) -> np.ndarray:
+    means = _require_means(params)
+    num_items = means.shape[0]
+    k = min(int(k), int(num_items))
+    if k <= 0:
+        raise ValueError("k must be positive")
+    if k == num_items:
+        return np.arange(num_items, dtype=np.int64)
+
+    rng = np.random.default_rng(seed)
+    if candidate_cap is not None and num_items > int(candidate_cap):
+        candidate_indices = np.sort(rng.choice(num_items, size=int(candidate_cap), replace=False)).astype(np.int64)
+    else:
+        candidate_indices = np.arange(num_items, dtype=np.int64)
+    candidate_points = means[candidate_indices]
+    target_k = min(k, candidate_indices.size)
+
+    selected_local = np.empty(target_k, dtype=np.int64)
+    selected_local[0] = int(rng.integers(0, candidate_indices.size))
+    min_dist2 = np.sum((candidate_points - candidate_points[selected_local[0]]) ** 2, axis=1)
+    for i in range(1, target_k):
+        selected_local[i] = int(np.argmax(min_dist2))
+        dist2 = np.sum((candidate_points - candidate_points[selected_local[i]]) ** 2, axis=1)
+        min_dist2 = np.minimum(min_dist2, dist2)
+
+    selected = candidate_indices[selected_local]
+    if selected.size < k:
+        fill_score_array = np.arange(num_items, 0, -1, dtype=np.float64) if fill_scores is None else np.asarray(fill_scores, dtype=np.float64)
+        selected = _fill_by_score(selected, fill_score_array, k)
+    return np.asarray(selected, dtype=np.int64)
+
+
+def score_selected(indices: np.ndarray, num_items: int) -> np.ndarray:
+    score_array = np.zeros(num_items, dtype=np.float64)
+    score_array[np.asarray(indices, dtype=np.int64)] = 1.0
+    return score_array
+
+
 def _num_gaussians_from_params(params: dict[str, Any]) -> int:
     if "means3D" in params:
         means = np.asarray(params["means3D"])
@@ -185,8 +299,25 @@ def select_by_strategy(
         score_array[indices] = 1.0
     elif strategy == "uniform_stride":
         indices = select_uniform_stride(num_items, k)
-        score_array = np.zeros(num_items, dtype=np.float64)
-        score_array[indices] = 1.0
+        score_array = score_selected(indices, num_items)
+    elif strategy == "voxel_grid_pure":
+        indices = select_voxel_grid(params, k)
+        score_array = score_selected(indices, num_items)
+    elif strategy in ("voxel_grid", "voxel_scale"):
+        score_array = score_scale_large(params)
+        indices = select_voxel_grid(params, k, fill_scores=score_array)
+    elif strategy == "voxel_scale_opacity":
+        score_array = score_scale_opacity(params)
+        indices = select_voxel_grid(params, k, fill_scores=score_array)
+    elif strategy == "fps_pure":
+        indices = select_farthest_point(params, k, seed=seed, candidate_cap=20000)
+        score_array = score_selected(indices, num_items)
+    elif strategy in ("fps", "fps_scale"):
+        score_array = score_scale_large(params)
+        indices = select_farthest_point(params, k, seed=seed, candidate_cap=20000, fill_scores=score_array)
+    elif strategy == "fps_scale_opacity":
+        score_array = score_scale_opacity(params)
+        indices = select_farthest_point(params, k, seed=seed, candidate_cap=20000, fill_scores=score_array)
     elif strategy == "opacity":
         score_array = score_opacity(params)
         indices = select_topk(score_array, k, largest=True)
@@ -195,6 +326,9 @@ def select_by_strategy(
         indices = select_topk(score_array, k, largest=True)
     elif strategy == "scale_large":
         score_array = score_scale_large(params)
+        indices = select_topk(score_array, k, largest=True)
+    elif strategy == "scale_x_opacity":
+        score_array = score_scale_opacity(params)
         indices = select_topk(score_array, k, largest=True)
     elif strategy == "external_scores":
         if scores is None:

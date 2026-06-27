@@ -112,6 +112,23 @@ def test_export_fisher_hybrid_strategy_uses_external_scores(tmp_path):
     assert (output_dir / "fisher_x_scale_count_2" / "fsm_map.npz").exists()
 
 
+def test_export_coverage_aware_strategies(tmp_path):
+    params_path = make_params_file(tmp_path, num_gaussians=12)
+    output_dir = tmp_path / "coverage_maps"
+    rows = export_fsm_maps(
+        params_path=str(params_path),
+        output_dir=str(output_dir),
+        strategies=["voxel_grid_pure", "voxel_scale", "fps_pure", "fps_scale", "scale_x_opacity"],
+        counts=[4],
+        seed=3,
+    )
+    assert len(rows) == 5
+    for row in rows:
+        fsm_map = load_fsm_map(row["map_path"])
+        assert fsm_map["means"].shape[0] == 4
+        validate_fsm_map(fsm_map)
+
+
 def test_load_external_scores_from_npz_and_npy(tmp_path):
     scores = np.array([1.0, 2.0, 3.0])
     npz_path = tmp_path / "scores.npz"

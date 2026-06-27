@@ -101,6 +101,31 @@ def test_register_known_translation_numpy_point_to_point():
     assert_transform_close(result["transform"], true_source_to_target, trans_tol=1e-3, rot_tol=1e-3)
 
 
+def test_register_known_translation_numpy_covariance_weighted():
+    target = make_asymmetric_points()
+    covariances = np.tile(np.eye(3, dtype=np.float64)[None, :, :] * 0.01, (target.shape[0], 1, 1))
+    true_source_to_target = make_transform(translation=(0.03, -0.02, 0.01), yaw_deg=0.0)
+    source = transform_points(target, invert_transform(true_source_to_target))
+    result = register_pointcloud(
+        source,
+        target,
+        init_transform=np.eye(4),
+        backend="numpy_covariance_weighted",
+        target_covariances=covariances,
+        max_correspondence_distance=0.2,
+        max_iterations=80,
+    )
+    assert result["converged"]
+    assert result["backend"] == "numpy_covariance_weighted"
+    assert_transform_close(result["transform"], true_source_to_target, trans_tol=1e-3, rot_tol=1e-3)
+
+
+def test_register_covariance_weighted_requires_covariances():
+    points = make_asymmetric_points()
+    with pytest.raises(ValueError):
+        register_pointcloud(points, points, backend="numpy_covariance_weighted")
+
+
 def test_register_known_rotation_numpy_point_to_point_with_good_init():
     target = make_asymmetric_points()
     true_source_to_target = make_transform(translation=(0.01, 0.0, 0.0), yaw_deg=8.0)

@@ -4,7 +4,12 @@ from typing import Any
 import numpy as np
 
 
-SUPPORTED_BACKENDS = ("numpy_point_to_point", "open3d_point_to_point", "open3d_point_to_plane")
+SUPPORTED_BACKENDS = (
+    "numpy_point_to_point",
+    "numpy_covariance_weighted",
+    "open3d_point_to_point",
+    "open3d_point_to_plane",
+)
 
 
 def _require_open3d():
@@ -100,6 +105,49 @@ def _best_fit_transform(source: np.ndarray, target: np.ndarray) -> np.ndarray:
     return T
 
 
+def _best_fit_transform_weighted(source: np.ndarray, target: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    weights = np.asarray(weights, dtype=np.float64)
+    if weights.ndim != 1 or weights.shape[0] != source.shape[0]:
+        raise ValueError(f"Expected weights with shape [{source.shape[0]}], got {weights.shape}")
+    weights = np.maximum(weights, 1e-12)
+    weights = weights / np.sum(weights)
+    source_centroid = np.sum(source * weights[:, None], axis=0)
+    target_centroid = np.sum(target * weights[:, None], axis=0)
+    source_centered = source - source_centroid
+    target_centered = target - target_centroid
+    H = (source_centered * weights[:, None]).T @ target_centered
+    U, _, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1.0
+        R = Vt.T @ U.T
+    t = target_centroid - R @ source_centroid
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    return T
+
+
+def _validate_covariances(covariances: np.ndarray | None, num_points: int) -> np.ndarray | None:
+    if covariances is None:
+        return None
+    covariances = np.asarray(covariances, dtype=np.float64)
+    if covariances.shape != (num_points, 3, 3):
+        raise ValueError(f"Expected target_covariances with shape [{num_points}, 3, 3], got {covariances.shape}")
+    if np.any(~np.isfinite(covariances)):
+        raise ValueError("target_covariances must be finite")
+    return 0.5 * (covariances + np.transpose(covariances, (0, 2, 1)))
+
+
+def _covariance_weights(covariances: np.ndarray, indices: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+    corr_cov = covariances[np.asarray(indices, dtype=np.int64)]
+    eigvals = np.linalg.eigvalsh(corr_cov)
+    variance = np.maximum(np.mean(np.maximum(eigvals, eps), axis=1), eps)
+    weights = 1.0 / variance
+    weights /= max(float(np.mean(weights)), eps)
+    return np.clip(weights, 1e-3, 1e3)
+
+
 def _is_valid_transform(transform: np.ndarray, max_translation_norm: float = 1e6) -> bool:
     transform = np.asarray(transform)
     if transform.shape != (4, 4) or np.any(~np.isfinite(transform)):
@@ -160,6 +208,59 @@ def _register_numpy_point_to_point(
     }
 
 
+def _register_numpy_covariance_weighted(
+    source_points: np.ndarray,
+    target_points: np.ndarray,
+    target_covariances: np.ndarray,
+    init_transform: np.ndarray,
+    max_correspondence_distance: float,
+    max_iterations: int,
+) -> dict[str, Any]:
+    transform = init_transform.copy()
+    inlier_rmse = float("inf")
+    fitness = 0.0
+    try:
+        from scipy.spatial import cKDTree
+
+        target_tree = cKDTree(target_points)
+    except Exception:
+        target_tree = None
+
+    for _ in range(max_iterations):
+        transformed = transform_points(source_points, transform)
+        nn_indices, distances = _nearest_neighbor_indices(transformed, target_points, target_tree=target_tree)
+        inlier_mask = distances <= max_correspondence_distance
+        if np.count_nonzero(inlier_mask) < 3:
+            break
+
+        src_corr = transformed[inlier_mask]
+        tgt_corr = target_points[nn_indices[inlier_mask]]
+        weights = _covariance_weights(target_covariances, nn_indices[inlier_mask])
+        delta = _best_fit_transform_weighted(src_corr, tgt_corr, weights)
+        if not _is_valid_transform(delta):
+            break
+        next_transform = delta @ transform
+        if not _is_valid_transform(next_transform):
+            break
+        transform = next_transform
+
+        prev_rmse = inlier_rmse
+        inlier_rmse = float(np.sqrt(np.average(distances[inlier_mask] ** 2, weights=weights)))
+        fitness = float(np.count_nonzero(inlier_mask) / source_points.shape[0])
+        if abs(prev_rmse - inlier_rmse) < 1e-9:
+            break
+
+    return {
+        "transform": transform,
+        "fitness": fitness,
+        "inlier_rmse": inlier_rmse,
+        "backend": "numpy_covariance_weighted",
+        "converged": bool(np.isfinite(inlier_rmse) and fitness > 0.0),
+        "num_source_points": int(source_points.shape[0]),
+        "num_target_points": int(target_points.shape[0]),
+    }
+
+
 def _make_point_cloud(points: np.ndarray):
     o3d = _require_open3d()
     pcd = o3d.geometry.PointCloud()
@@ -200,6 +301,7 @@ def register_pointcloud(
     max_iterations: int = 30,
     normal_radius: float | None = None,
     normal_max_nn: int = 30,
+    target_covariances: np.ndarray | None = None,
 ) -> dict[str, Any]:
     if backend not in SUPPORTED_BACKENDS:
         raise ValueError(f"Unknown registration backend '{backend}'. Supported: {SUPPORTED_BACKENDS}")
@@ -210,6 +312,7 @@ def register_pointcloud(
 
     source_points = _validate_points(source_points, "source_points")
     target_points = _validate_points(target_points, "target_points")
+    target_covariances = _validate_covariances(target_covariances, target_points.shape[0])
     init_transform = _validate_transform(init_transform)
 
     if backend == "numpy_point_to_point":
@@ -217,6 +320,21 @@ def register_pointcloud(
         result = _register_numpy_point_to_point(
             source_points=source_points,
             target_points=target_points,
+            init_transform=init_transform,
+            max_correspondence_distance=float(max_correspondence_distance),
+            max_iterations=int(max_iterations),
+        )
+        result["latency_ms"] = float((time.perf_counter() - start) * 1000.0)
+        return result
+
+    if backend == "numpy_covariance_weighted":
+        if target_covariances is None:
+            raise ValueError("target_covariances must be provided for backend='numpy_covariance_weighted'")
+        start = time.perf_counter()
+        result = _register_numpy_covariance_weighted(
+            source_points=source_points,
+            target_points=target_points,
+            target_covariances=target_covariances,
             init_transform=init_transform,
             max_correspondence_distance=float(max_correspondence_distance),
             max_iterations=int(max_iterations),

@@ -6,17 +6,20 @@ from utils.fsm_pruning import (
     score_opacity,
     score_fisher_hybrid,
     score_scale_large,
+    score_scale_opacity,
     score_scale_small,
+    select_farthest_point,
     select_by_strategy,
     select_random,
     select_topk,
     select_uniform_stride,
+    select_voxel_grid,
 )
 
 
 def make_params(num_gaussians=5):
     return {
-        "means3D": np.zeros((num_gaussians, 3), dtype=np.float32),
+        "means3D": np.arange(num_gaussians * 3, dtype=np.float32).reshape(num_gaussians, 3),
         "log_scales": np.log(np.array([[0.5], [0.1], [0.4], [0.2], [0.3]], dtype=np.float32)[:num_gaussians]),
         "logit_opacities": np.array([[-2.0], [3.0], [0.0], [1.0], [-1.0]], dtype=np.float32)[:num_gaussians],
     }
@@ -77,7 +80,40 @@ def test_select_uniform_stride_includes_endpoints():
     np.testing.assert_array_equal(indices, np.array([0, 3, 6, 9]))
 
 
-@pytest.mark.parametrize("strategy", ["full", "random", "opacity", "scale_small", "scale_large", "uniform_stride"])
+def test_select_voxel_grid_outputs_requested_budget():
+    params = make_params()
+    indices = select_voxel_grid(params, 3)
+    assert indices.shape == (3,)
+    assert np.unique(indices).size == 3
+
+
+def test_select_farthest_point_outputs_requested_budget():
+    params = make_params()
+    indices = select_farthest_point(params, 3, seed=3)
+    assert indices.shape == (3,)
+    assert np.unique(indices).size == 3
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        "full",
+        "random",
+        "opacity",
+        "scale_small",
+        "scale_large",
+        "scale_x_opacity",
+        "uniform_stride",
+        "voxel_grid_pure",
+        "voxel_grid",
+        "voxel_scale",
+        "voxel_scale_opacity",
+        "fps_pure",
+        "fps",
+        "fps_scale",
+        "fps_scale_opacity",
+    ],
+)
 def test_select_by_strategy_outputs_valid_indices_and_scores(strategy):
     params = make_params()
     indices, scores = select_by_strategy(params, strategy, compression_ratio=0.4, seed=0)
@@ -105,6 +141,35 @@ def test_select_by_scale_large_prefers_large_scales():
     params = make_params()
     indices, _ = select_by_strategy(params, "scale_large", count=2)
     np.testing.assert_array_equal(indices, np.array([0, 2]))
+
+
+def test_score_scale_opacity_blends_scale_and_opacity():
+    params = make_params()
+    scores = score_scale_opacity(params, scale_weight=0.5, opacity_weight=0.5)
+    assert scores.shape == (5,)
+    assert np.all(scores >= 0.0)
+    assert np.argmax(scores) in {0, 1, 2, 3}
+
+
+def test_scale_x_opacity_selects_from_combined_score():
+    params = make_params()
+    indices, scores = select_by_strategy(params, "scale_x_opacity", count=2)
+    expected = np.argsort(-scores, kind="mergesort")[:2]
+    np.testing.assert_array_equal(indices, expected)
+
+
+def test_legacy_voxel_grid_matches_explicit_voxel_scale():
+    params = make_params()
+    legacy, _ = select_by_strategy(params, "voxel_grid", count=3)
+    explicit, _ = select_by_strategy(params, "voxel_scale", count=3)
+    np.testing.assert_array_equal(legacy, explicit)
+
+
+def test_legacy_fps_matches_explicit_fps_scale():
+    params = make_params()
+    legacy, _ = select_by_strategy(params, "fps", count=3, seed=3)
+    explicit, _ = select_by_strategy(params, "fps_scale", count=3, seed=3)
+    np.testing.assert_array_equal(legacy, explicit)
 
 
 def test_select_by_external_scores():

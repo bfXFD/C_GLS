@@ -13,7 +13,7 @@ if BASE_DIR not in sys.path:
 
 import numpy as np
 
-from scripts.fsm_export import export_fsm_maps
+from scripts.fsm_export import export_fsm_maps, load_external_scores
 from scripts.fsm_fisher import compute_and_save_fisher
 from scripts.fsm_localize import load_config, run_localization
 from utils.fsm_dataset import load_dataset_from_config
@@ -48,6 +48,7 @@ SUMMARY_ALL_FIELDS = [
     "max_corr_dist",
     "init_mode",
     "seed",
+    "score_source",
 ]
 
 TASK_PLAN_FIELDS = [
@@ -75,6 +76,8 @@ def parse_args():
     parser.add_argument("--overwrite", action="store_true", help="Overwrite exported map variant directories.")
     parser.add_argument("--fisher-max-points", type=int, default=200000, help="Deterministic point subsample used for Fisher on large maps.")
     parser.add_argument("--fisher-seed", type=int, default=None, help="Seed for Fisher subsampling. Defaults to config seed + 10007.")
+    parser.add_argument("--external-scores", default=None, help="Optional .npz/.npy score file used by external/Fisher strategies.")
+    parser.add_argument("--external-scores-key", default="scores", help="Key used when --external-scores points to an .npz file.")
     return parser.parse_args()
 
 
@@ -163,6 +166,7 @@ def empty_summary_row(
         "max_corr_dist": registration_cfg.get("max_correspondence_distance", ""),
         "init_mode": registration_cfg.get("init_mode", ""),
         "seed": config.get("seed", ""),
+        "score_source": "",
     }
 
 
@@ -228,11 +232,14 @@ def run_eval(
     overwrite: bool = False,
     fisher_max_points: int | None = 200000,
     fisher_seed: int | None = None,
+    external_scores_path: str | None = None,
+    external_scores_key: str = "scores",
 ) -> dict[str, Any]:
     config = load_config(config_path)
     strategies = strategies or config.get("fsm", {}).get("strategies", ["full"])
     compression_ratios = compression_ratios or config.get("fsm", {}).get("compression_ratios", [1.0])
     fisher_seed = int(config.get("seed", 0)) + 10007 if fisher_seed is None else int(fisher_seed)
+    external_scores = load_external_scores(external_scores_path, key=external_scores_key) if external_scores_path else None
 
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -250,6 +257,7 @@ def run_eval(
         output_dir=str(output_root / "maps"),
         strategies=strategies,
         compression_ratios=compression_ratios,
+        external_scores=external_scores,
         seed=int(config.get("seed", 0)),
         overwrite=overwrite,
     )
@@ -301,6 +309,7 @@ def run_eval(
                 fisher_path=retained_fisher_path,
             )
         )
+        summary_rows[-1]["score_source"] = external_scores_path or ""
 
     _write_csv(output_root / "summary_all.csv", SUMMARY_ALL_FIELDS, summary_rows)
     return {"tasks": task_plan, "summary_rows": summary_rows, "dry_run": False}
@@ -321,6 +330,8 @@ def main() -> None:
         overwrite=args.overwrite,
         fisher_max_points=args.fisher_max_points,
         fisher_seed=args.fisher_seed,
+        external_scores_path=args.external_scores,
+        external_scores_key=args.external_scores_key,
     )
     mode = "planned" if result["dry_run"] else "completed"
     print(f"FSM eval {mode}: {len(result['tasks'])} tasks, output={args.output_dir}")
