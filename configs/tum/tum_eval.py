@@ -86,6 +86,7 @@ config = dict(
         add_new_gaussians=True,
         sil_thres=0.5, # For Addition of new Gaussians
         use_l1=True,
+        ignore_outlier_depth_loss=False,
         use_sil_for_loss=False,
         use_uncertainty_for_loss_mask=False,
         use_uncertainty_for_loss=False,

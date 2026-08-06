@@ -1,8 +1,75 @@
-<!-- PROJECT LOGO -->
+<p align="center">
+  <h1 align="center">C-GLS: Coverage-Aware Gaussian Localization Skeleton</h1>
+  <h3 align="center">Localization-Oriented Compression for 3D Gaussian Maps</h3>
+</p>
+
+## Overview
+
+C-GLS is a localization-oriented 3D Gaussian map compression project built on top of [SplaTAM](https://github.com/spla-tam/SplaTAM). SplaTAM first reconstructs a dense RGB-D scene and exports the Gaussian map as `params.npz`. C-GLS then operates on this existing map as an offline post-processing stage: it preserves scene-wide spatial coverage, ranks Gaussian primitives by scale-opacity structural saliency, and exports a compact localization skeleton for RGB-D pose estimation.
+
+The project therefore separates two tasks:
+
+1. **Dense map construction:** use SplaTAM to reconstruct the scene and produce the original 3D Gaussian map.
+2. **Localization-map compression:** use C-GLS to compress that map for efficient tracking-style RGB-D localization.
+
+C-GLS does not replace the SplaTAM mapper and does not optimize rendering fidelity as its primary objective. Compressed maps are evaluated using localization accuracy (ATE/RPE), CPU registration latency, map size, spatial coverage, rendering-localization decoupling, and conservative post-pruning quantization.
+
+## C-GLS Components
+
+- `utils/fsm_pruning.py`: random, coverage-only, saliency-only, Fisher-style, C-GLS-Voxel, and FPS-C-GLS selection strategies.
+- `utils/fsm_map.py`: loading and exporting compact Gaussian maps.
+- `utils/fsm_registration.py`: RGB-D localization against compressed Gaussian skeletons.
+- `utils/fsm_metrics.py`: ATE and RPE evaluation.
+- `scripts/fsm_eval.py`: unified compression and localization evaluation entry point.
+- `scripts/fsm_plan_pareto.py`: Replica Pareto experiment planning.
+- `scripts/fsm_plan_tum.py`: TUM RGB-D experiment planning.
+- `scripts/fsm_render_eval.py`: rendering-localization decoupling evaluation.
+- `scripts/fsm_quantize_map.py`: conservative means-only FP16 quantization and score removal.
+- `scripts/fsm_multiscene_visualization.py`: paper visualization generation.
+- `configs/fsm/`: Replica and TUM RGB-D C-GLS experiment configurations.
+- `tests/test_fsm_*.py`: unit tests for map export, pruning, metrics, registration, planning, and quantization.
+
+## Typical Workflow
+
+Generate a dense Gaussian map with SplaTAM:
+
+```bash
+python scripts/splatam.py configs/replica/splatam.py
+```
+
+Export and evaluate a C-GLS localization skeleton from the generated `params.npz` map:
+
+```bash
+python scripts/fsm_eval.py \
+  --config configs/fsm/replica_fsm.py \
+  --params /path/to/splatam/params.npz \
+  --output-dir experiments/FSM/example \
+  --strategies voxel_scale_opacity fps_scale_opacity \
+  --ratios 0.20 0.10
+```
+
+Run the core C-GLS tests:
+
+```bash
+PYTHONPATH="$PWD" PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  pytest tests/test_fsm_*.py tests/test_tum_dataset_compat.py
+```
+
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` prevents unrelated system-wide plugins, such as ROS launch-testing plugins, from interfering with the C-GLS test environment.
+
+Large datasets, generated SplaTAM maps, experiment outputs, and rendered results are intentionally excluded from Git through `.gitignore`.
+
+## Upstream SplaTAM
+
+The remainder of this README preserves the original SplaTAM documentation for installation, map construction, datasets, and attribution.
+
+---
+
+<!-- UPSTREAM PROJECT LOGO -->
 
 <p align="center">
 
-  <h1 align="center">SplaTAM: Splat, Track & Map 3D Gaussians for Dense RGB-D SLAM</h1>
+  <h2 align="center">SplaTAM: Splat, Track & Map 3D Gaussians for Dense RGB-D SLAM</h2>
   <h3 align="center">CVPR 2024</h3>
   <p align="center">
     <a href="https://nik-v9.github.io/"><strong>Nikhil Keetha</strong></a>
@@ -31,7 +98,7 @@
 
 <br>
 
-## Stay Tuned for a Faster and Better Variant of SplaTAM! 
+## Original SplaTAM Documentation
 
 <!-- TABLE OF CONTENTS -->
 <details open="open" style='padding: 10px; border-radius:5px 30px 30px 5px; border-style: solid; border-width: 1px;'>

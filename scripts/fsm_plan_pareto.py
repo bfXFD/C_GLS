@@ -4,19 +4,19 @@ from pathlib import Path
 
 DEFAULT_SCENES = {
     "room0_0": {
-        "config": "/home/ras/xbf/SplaTAM_modify/configs/fsm/replica_fsm.py",
+        "config": "/home/ras/xbf/C_GLS_code/configs/fsm/replica_fsm.py",
         "params": "/home/ras/xbf/SplaTAM/experiments/Replica/room0_0/params.npz",
     },
     "room1_0": {
-        "config": "/home/ras/xbf/SplaTAM_modify/configs/fsm/generated/replica_room1_fsm.py",
+        "config": "/home/ras/xbf/C_GLS_code/configs/fsm/generated/replica_room1_fsm.py",
         "params": "/home/ras/xbf/SplaTAM/experiments/Replica/room1_0/params.npz",
     },
     "room2_0": {
-        "config": "/home/ras/xbf/SplaTAM_modify/configs/fsm/generated/replica_room2_fsm.py",
+        "config": "/home/ras/xbf/C_GLS_code/configs/fsm/generated/replica_room2_fsm.py",
         "params": "/home/ras/xbf/SplaTAM/experiments/Replica/room2_0/params.npz",
     },
     "office0_0": {
-        "config": "/home/ras/xbf/SplaTAM_modify/configs/fsm/generated/replica_office0_fsm.py",
+        "config": "/home/ras/xbf/C_GLS_code/configs/fsm/generated/replica_office0_fsm.py",
         "params": "/home/ras/xbf/SplaTAM/experiments/Replica/office0_0/params.npz",
     },
 }
@@ -48,12 +48,12 @@ def build_commands(
     end: int,
     conda_env: str,
 ) -> list[str]:
-    commands = ["#!/usr/bin/env bash", "set -euo pipefail", "", "cd /home/ras/xbf/SplaTAM_modify", ""]
+    commands = ["#!/usr/bin/env bash", "set -euo pipefail", "", "cd /home/ras/xbf/C_GLS_code", ""]
     strategy_args = " ".join(strategies)
     ratio_args = " ".join(ratios)
     for scene in scenes:
         scene_cfg = DEFAULT_SCENES[scene]
-        output_dir = f"/home/ras/xbf/SplaTAM_modify/experiments/FSM/replica_{scene}/{experiment_name}"
+        output_dir = f"/home/ras/xbf/C_GLS_code/experiments/FSM/replica_{scene}/{experiment_name}"
         commands.extend(
             [
                 f"# {scene}",
