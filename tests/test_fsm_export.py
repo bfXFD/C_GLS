@@ -55,6 +55,7 @@ def test_export_fsm_maps_writes_maps_and_summary(tmp_path):
         "map_path",
         "source_params_path",
         "seed",
+        "fps_candidate_cap",
     }
 
     for row in summary_rows:

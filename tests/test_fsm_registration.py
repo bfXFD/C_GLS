@@ -4,7 +4,10 @@ import importlib.util
 import numpy as np
 import pytest
 
+import utils.fsm_robust_registration as robust_registration
 from utils.fsm_registration import (
+    SUPPORTED_BACKENDS,
+    build_target_index,
     compose_transform,
     estimate_normals,
     invert_transform,
@@ -83,6 +86,21 @@ def test_register_identity_numpy_point_to_point():
     assert result["converged"]
     assert result["fitness"] > 0.99
     assert_transform_close(result["transform"], np.eye(4), trans_tol=1e-6, rot_tol=1e-6)
+
+
+def test_register_reuses_prebuilt_target_index():
+    points = make_asymmetric_points()
+    index = build_target_index(points)
+    result = register_pointcloud(
+        points,
+        points,
+        backend="numpy_point_to_point",
+        target_tree=index["target_tree"],
+        max_correspondence_distance=0.2,
+        max_iterations=10,
+    )
+    assert index["build_latency_ms"] >= 0.0
+    assert result["converged"]
 
 
 def test_register_known_translation_numpy_point_to_point():
@@ -194,3 +212,65 @@ def test_register_rejects_bad_init_shape():
     points = make_asymmetric_points()
     with pytest.raises(ValueError):
         register_pointcloud(points, points, init_transform=np.eye(3), backend="open3d_point_to_point")
+
+
+def test_robust_wrapper_forwards_all_options_and_records_latency(monkeypatch):
+    points = make_asymmetric_points()
+    normals = np.tile([0.0, 0.0, 1.0], (points.shape[0], 1))
+    tree = object()
+    captured = {}
+
+    def fake_register(**kwargs):
+        captured.update(kwargs)
+        return {
+            "transform": kwargs["init_transform"],
+            "fitness": 1.0,
+            "inlier_rmse": 0.0,
+            "converged": True,
+            "num_source_points": points.shape[0],
+            "num_target_points": points.shape[0],
+        }
+
+    monkeypatch.setattr(robust_registration, "register_robust_point_to_plane", fake_register)
+    result = register_pointcloud(
+        points,
+        points,
+        backend="numpy_robust_point_to_plane",
+        target_normals=normals,
+        target_tree=tree,
+        max_correspondence_distance=0.3,
+        max_iterations=17,
+        robust_loss="cauchy",
+        loss_scale=0.04,
+        lm_damping=0.002,
+        min_correspondences=9,
+        normal_k=13,
+        step_tolerance=1e-7,
+        cost_tolerance=2e-9,
+        rotation_step_tolerance_deg=0.02,
+        translation_step_tolerance_m=2e-4,
+        relative_cost_tolerance=3e-5,
+        convergence_patience=4,
+        min_iterations=5,
+        rank_tolerance=3e-8,
+    )
+
+    assert "numpy_robust_point_to_plane" in SUPPORTED_BACKENDS
+    assert captured["target_normals"] is normals
+    assert captured["target_tree"] is tree
+    assert captured["max_correspondence_distance"] == 0.3
+    assert captured["max_iterations"] == 17
+    assert captured["loss"] == "cauchy"
+    assert captured["loss_scale"] == 0.04
+    assert captured["lm_damping"] == 0.002
+    assert captured["min_correspondences"] == 9
+    assert captured["normal_k"] == 13
+    assert captured["step_tolerance"] == 1e-7
+    assert captured["cost_tolerance"] == 2e-9
+    assert captured["rotation_step_tolerance_deg"] == 0.02
+    assert captured["translation_step_tolerance_m"] == 2e-4
+    assert captured["relative_cost_tolerance"] == 3e-5
+    assert captured["convergence_patience"] == 4
+    assert captured["min_iterations"] == 5
+    assert captured["rank_tolerance"] == 3e-8
+    assert result["latency_ms"] >= 0.0

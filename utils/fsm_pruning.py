@@ -91,10 +91,17 @@ def score_scale_large(params: dict[str, Any]) -> np.ndarray:
     return _scale_magnitude(params)
 
 
-def score_scale_opacity(params: dict[str, Any], scale_weight: float = 0.7, opacity_weight: float = 0.3) -> np.ndarray:
-    return float(scale_weight) * _normalize_score(score_scale_large(params)) + float(opacity_weight) * _normalize_score(
-        score_opacity(params)
-    )
+def score_scale_opacity(params: dict[str, Any], gamma: float = 1.0 / 3.0, beta: float = 1.0) -> np.ndarray:
+    if gamma < 0 or beta < 0:
+        raise ValueError("gamma and beta must be non-negative")
+    if "log_scales" not in params:
+        raise KeyError("Missing required field 'log_scales' for scale scoring")
+
+    log_scales = expand_log_scales(np.asarray(params["log_scales"], dtype=np.float64))
+    opacity = np.clip(score_opacity(params), 1e-12, 1.0)
+    log_score = float(gamma) * np.sum(log_scales, axis=1) + float(beta) * np.log(opacity)
+    log_score -= float(np.max(log_score))
+    return np.exp(log_score).astype(np.float64)
 
 
 def _normalize_score(scores: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -191,14 +198,28 @@ def select_voxel_grid(params: dict[str, Any], k: int, fill_scores: np.ndarray | 
     volume = float(np.prod(np.maximum(span, np.min(positive_span))))
     voxel_size = max((volume / max(k, 1)) ** (1.0 / 3.0), 1e-12)
     grid = np.floor((means - np.min(means, axis=0)) / voxel_size).astype(np.int64)
-    _, first_indices = np.unique(grid, axis=0, return_index=True)
-    selected = np.sort(first_indices.astype(np.int64))
+    if fill_scores is None:
+        order = np.arange(num_items, dtype=np.int64)
+    else:
+        score_array = np.asarray(fill_scores, dtype=np.float64)
+        if score_array.shape != (num_items,) or np.any(~np.isfinite(score_array)):
+            raise ValueError(f"Expected finite fill_scores with shape [{num_items}], got {score_array.shape}")
+        order = np.argsort(-score_array, kind="mergesort")
+
+    seen_voxels = set()
+    selected_list = []
+    for idx in order:
+        voxel = tuple(int(value) for value in grid[idx])
+        if voxel in seen_voxels:
+            continue
+        seen_voxels.add(voxel)
+        selected_list.append(int(idx))
+    selected = np.asarray(selected_list, dtype=np.int64)
 
     if selected.size > k:
         if fill_scores is None:
             selected = selected[np.linspace(0, selected.size - 1, num=k, dtype=np.int64)]
         else:
-            score_array = np.asarray(fill_scores, dtype=np.float64)
             selected = selected[np.argsort(-score_array[selected], kind="mergesort")[:k]]
     elif selected.size < k:
         fill_score_array = np.arange(num_items, 0, -1, dtype=np.float64) if fill_scores is None else np.asarray(fill_scores, dtype=np.float64)
@@ -283,6 +304,7 @@ def select_by_strategy(
     count: int | None = None,
     scores: np.ndarray | None = None,
     seed: int = 0,
+    fps_candidate_cap: int | None = 20000,
 ) -> tuple[np.ndarray, np.ndarray]:
     if strategy not in SUPPORTED_STRATEGIES:
         raise ValueError(f"Unknown pruning strategy '{strategy}'. Supported: {SUPPORTED_STRATEGIES}")
@@ -310,14 +332,14 @@ def select_by_strategy(
         score_array = score_scale_opacity(params)
         indices = select_voxel_grid(params, k, fill_scores=score_array)
     elif strategy == "fps_pure":
-        indices = select_farthest_point(params, k, seed=seed, candidate_cap=20000)
+        indices = select_farthest_point(params, k, seed=seed, candidate_cap=fps_candidate_cap)
         score_array = score_selected(indices, num_items)
     elif strategy in ("fps", "fps_scale"):
         score_array = score_scale_large(params)
-        indices = select_farthest_point(params, k, seed=seed, candidate_cap=20000, fill_scores=score_array)
+        indices = select_farthest_point(params, k, seed=seed, candidate_cap=fps_candidate_cap, fill_scores=score_array)
     elif strategy == "fps_scale_opacity":
         score_array = score_scale_opacity(params)
-        indices = select_farthest_point(params, k, seed=seed, candidate_cap=20000, fill_scores=score_array)
+        indices = select_farthest_point(params, k, seed=seed, candidate_cap=fps_candidate_cap, fill_scores=score_array)
     elif strategy == "opacity":
         score_array = score_opacity(params)
         indices = select_topk(score_array, k, largest=True)

@@ -143,12 +143,24 @@ def test_select_by_scale_large_prefers_large_scales():
     np.testing.assert_array_equal(indices, np.array([0, 2]))
 
 
-def test_score_scale_opacity_blends_scale_and_opacity():
+def test_score_scale_opacity_matches_geometric_mean_times_opacity():
     params = make_params()
-    scores = score_scale_opacity(params, scale_weight=0.5, opacity_weight=0.5)
-    assert scores.shape == (5,)
-    assert np.all(scores >= 0.0)
-    assert np.argmax(scores) in {0, 1, 2, 3}
+    scores = score_scale_opacity(params, gamma=1.0 / 3.0, beta=1.0)
+    scales = np.exp(np.repeat(params["log_scales"], 3, axis=1))
+    opacity = 1.0 / (1.0 + np.exp(-params["logit_opacities"][:, 0]))
+    expected = np.prod(scales, axis=1) ** (1.0 / 3.0) * opacity
+    expected /= np.max(expected)
+    np.testing.assert_allclose(scores, expected, rtol=2e-7)
+
+
+def test_select_voxel_grid_uses_highest_score_per_voxel():
+    params = make_params(4)
+    params["means3D"] = np.array(
+        [[0.0, 0.0, 0.0], [0.01, 0.0, 0.0], [1.0, 0.0, 0.0], [1.01, 0.0, 0.0]], dtype=np.float32
+    )
+    scores = np.array([1.0, 10.0, 2.0, 20.0])
+    indices = select_voxel_grid(params, 2, fill_scores=scores)
+    np.testing.assert_array_equal(indices, np.array([3, 1]))
 
 
 def test_scale_x_opacity_selects_from_combined_score():

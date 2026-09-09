@@ -25,6 +25,7 @@ SUMMARY_FIELDS = [
     "map_path",
     "source_params_path",
     "seed",
+    "fps_candidate_cap",
 ]
 
 
@@ -60,6 +61,12 @@ def parse_args():
     )
     parser.add_argument("--external-scores-key", default="scores", help="Key used when --external-scores is an .npz file.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for random pruning.")
+    parser.add_argument(
+        "--fps-candidate-cap",
+        type=int,
+        default=20000,
+        help="Maximum random candidate pool for approximate FPS; use 0 for exact full-map FPS.",
+    )
     parser.add_argument("--covariance-eps", type=float, default=1e-6, help="Positive diagonal covariance jitter.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output directories/files.")
     return parser.parse_args()
@@ -114,6 +121,7 @@ def export_fsm_maps(
     counts: list[int] | None = None,
     external_scores: np.ndarray | None = None,
     seed: int = 0,
+    fps_candidate_cap: int | None = 20000,
     covariance_eps: float = 1e-6,
     overwrite: bool = False,
 ) -> list[dict]:
@@ -141,6 +149,7 @@ def export_fsm_maps(
                 count=count,
                 scores=external_scores,
                 seed=seed,
+                fps_candidate_cap=fps_candidate_cap,
             )
             effective_ratio = float(selected_indices.size / num_full)
             variant_dir = output_root / _variant_name(strategy, compression_ratio, count)
@@ -168,6 +177,7 @@ def export_fsm_maps(
                     "map_path": str(map_path),
                     "source_params_path": params_path,
                     "seed": str(seed),
+                    "fps_candidate_cap": "" if fps_candidate_cap is None else str(fps_candidate_cap),
                 }
             )
 
@@ -186,6 +196,7 @@ def main() -> None:
         counts=args.counts,
         external_scores=external_scores,
         seed=args.seed,
+        fps_candidate_cap=None if args.fps_candidate_cap == 0 else args.fps_candidate_cap,
         covariance_eps=args.covariance_eps,
         overwrite=args.overwrite,
     )

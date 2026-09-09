@@ -82,6 +82,9 @@ def test_run_eval_dry_run_writes_plan_and_summary_schema(tmp_path):
     assert summary_rows[0]["backend"] == "numpy_point_to_point"
     assert summary_rows[0]["seed"] == "7"
     assert "score_source" in summary_rows[0]
+    assert "target_index_build_ms" in summary_rows[0]
+    assert "cold_start_latency_ms" in summary_rows[0]
+    assert "fps_candidate_cap" in summary_rows[0]
 
 
 def test_run_eval_dry_run_cli_overrides_strategies_and_ratios(tmp_path):

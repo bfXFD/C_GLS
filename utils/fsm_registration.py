@@ -7,6 +7,7 @@ import numpy as np
 SUPPORTED_BACKENDS = (
     "numpy_point_to_point",
     "numpy_covariance_weighted",
+    "numpy_robust_point_to_plane",
     "open3d_point_to_point",
     "open3d_point_to_plane",
 )
@@ -87,6 +88,25 @@ def _nearest_neighbor_indices(
     return indices.astype(np.int64), distances
 
 
+def build_target_index(target_points: np.ndarray) -> dict[str, Any]:
+    target_points = _validate_points(target_points, "target_points")
+    start = time.perf_counter()
+    try:
+        from scipy.spatial import cKDTree
+
+        target_tree = cKDTree(target_points)
+        backend = "scipy_cKDTree"
+    except Exception:
+        target_tree = None
+        backend = "brute_force"
+    return {
+        "target_tree": target_tree,
+        "build_latency_ms": float((time.perf_counter() - start) * 1000.0),
+        "backend": backend,
+        "num_target_points": int(target_points.shape[0]),
+    }
+
+
 def _best_fit_transform(source: np.ndarray, target: np.ndarray) -> np.ndarray:
     source_centroid = np.mean(source, axis=0)
     target_centroid = np.mean(target, axis=0)
@@ -163,16 +183,13 @@ def _register_numpy_point_to_point(
     init_transform: np.ndarray,
     max_correspondence_distance: float,
     max_iterations: int,
+    target_tree: Any | None = None,
 ) -> dict[str, Any]:
     transform = init_transform.copy()
     inlier_rmse = float("inf")
     fitness = 0.0
-    try:
-        from scipy.spatial import cKDTree
-
-        target_tree = cKDTree(target_points)
-    except Exception:
-        target_tree = None
+    if target_tree is None:
+        target_tree = build_target_index(target_points)["target_tree"]
 
     for _ in range(max_iterations):
         transformed = transform_points(source_points, transform)
@@ -215,16 +232,13 @@ def _register_numpy_covariance_weighted(
     init_transform: np.ndarray,
     max_correspondence_distance: float,
     max_iterations: int,
+    target_tree: Any | None = None,
 ) -> dict[str, Any]:
     transform = init_transform.copy()
     inlier_rmse = float("inf")
     fitness = 0.0
-    try:
-        from scipy.spatial import cKDTree
-
-        target_tree = cKDTree(target_points)
-    except Exception:
-        target_tree = None
+    if target_tree is None:
+        target_tree = build_target_index(target_points)["target_tree"]
 
     for _ in range(max_iterations):
         transformed = transform_points(source_points, transform)
@@ -302,6 +316,21 @@ def register_pointcloud(
     normal_radius: float | None = None,
     normal_max_nn: int = 30,
     target_covariances: np.ndarray | None = None,
+    target_normals: np.ndarray | None = None,
+    target_tree: Any | None = None,
+    robust_loss: str = "huber",
+    loss_scale: float = 0.02,
+    lm_damping: float = 1e-3,
+    min_correspondences: int = 6,
+    normal_k: int = 20,
+    step_tolerance: float | None = None,
+    cost_tolerance: float | None = None,
+    rotation_step_tolerance_deg: float = 0.01,
+    translation_step_tolerance_m: float = 1e-4,
+    relative_cost_tolerance: float = 1e-5,
+    convergence_patience: int = 2,
+    min_iterations: int = 2,
+    rank_tolerance: float = 1e-9,
 ) -> dict[str, Any]:
     if backend not in SUPPORTED_BACKENDS:
         raise ValueError(f"Unknown registration backend '{backend}'. Supported: {SUPPORTED_BACKENDS}")
@@ -315,6 +344,35 @@ def register_pointcloud(
     target_covariances = _validate_covariances(target_covariances, target_points.shape[0])
     init_transform = _validate_transform(init_transform)
 
+    if backend == "numpy_robust_point_to_plane":
+        from utils.fsm_robust_registration import register_robust_point_to_plane
+
+        start = time.perf_counter()
+        result = register_robust_point_to_plane(
+            source_points=source_points,
+            target_points=target_points,
+            init_transform=init_transform,
+            target_normals=target_normals,
+            max_correspondence_distance=float(max_correspondence_distance),
+            max_iterations=int(max_iterations),
+            loss=robust_loss,
+            loss_scale=float(loss_scale),
+            lm_damping=float(lm_damping),
+            min_correspondences=int(min_correspondences),
+            normal_k=int(normal_k),
+            target_tree=target_tree,
+            step_tolerance=None if step_tolerance is None else float(step_tolerance),
+            cost_tolerance=None if cost_tolerance is None else float(cost_tolerance),
+            rotation_step_tolerance_deg=float(rotation_step_tolerance_deg),
+            translation_step_tolerance_m=float(translation_step_tolerance_m),
+            relative_cost_tolerance=float(relative_cost_tolerance),
+            convergence_patience=int(convergence_patience),
+            min_iterations=int(min_iterations),
+            rank_tolerance=float(rank_tolerance),
+        )
+        result["latency_ms"] = float((time.perf_counter() - start) * 1000.0)
+        return result
+
     if backend == "numpy_point_to_point":
         start = time.perf_counter()
         result = _register_numpy_point_to_point(
@@ -323,6 +381,7 @@ def register_pointcloud(
             init_transform=init_transform,
             max_correspondence_distance=float(max_correspondence_distance),
             max_iterations=int(max_iterations),
+            target_tree=target_tree,
         )
         result["latency_ms"] = float((time.perf_counter() - start) * 1000.0)
         return result
@@ -338,6 +397,7 @@ def register_pointcloud(
             init_transform=init_transform,
             max_correspondence_distance=float(max_correspondence_distance),
             max_iterations=int(max_iterations),
+            target_tree=target_tree,
         )
         result["latency_ms"] = float((time.perf_counter() - start) * 1000.0)
         return result

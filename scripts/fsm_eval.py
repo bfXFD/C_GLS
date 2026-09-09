@@ -41,6 +41,8 @@ SUMMARY_ALL_FIELDS = [
     "registration_rmse",
     "latency_mean_ms",
     "latency_p95_ms",
+    "target_index_build_ms",
+    "cold_start_latency_ms",
     "memory_mb",
     "map_size_mb",
     "backend",
@@ -48,7 +50,22 @@ SUMMARY_ALL_FIELDS = [
     "max_corr_dist",
     "init_mode",
     "seed",
+    "fps_candidate_cap",
     "score_source",
+    "reserve_corr_frame_count",
+    "reserve_corr_ok_frame_count",
+    "reserve_corr_unavailable_frame_count",
+    "reserve_corr_normal_valid_rate_mean",
+    "reserve_corr_distance_valid_rate_mean",
+    "reserve_corr_eligible_mean",
+    "reserve_corr_p_mean",
+    "reserve_corr_p_nonzero_rate_mean",
+    "reserve_corr_selected_p_mean",
+    "reserve_corr_selected_p10_mean",
+    "reserve_corr_selected_p_min_mean",
+    "reserve_corr_adaptive_k_mean",
+    "reserve_corr_characteristic_length_mean",
+    "reserve_corr_latency_mean_ms",
 ]
 
 TASK_PLAN_FIELDS = [
@@ -76,6 +93,13 @@ def parse_args():
     parser.add_argument("--overwrite", action="store_true", help="Overwrite exported map variant directories.")
     parser.add_argument("--fisher-max-points", type=int, default=200000, help="Deterministic point subsample used for Fisher on large maps.")
     parser.add_argument("--fisher-seed", type=int, default=None, help="Seed for Fisher subsampling. Defaults to config seed + 10007.")
+    parser.add_argument("--seed", type=int, default=None, help="Override the config seed for stochastic pruning.")
+    parser.add_argument(
+        "--fps-candidate-cap",
+        type=int,
+        default=20000,
+        help="Maximum candidate pool for approximate FPS; use 0 for exact full-map FPS.",
+    )
     parser.add_argument("--external-scores", default=None, help="Optional .npz/.npy score file used by external/Fisher strategies.")
     parser.add_argument("--external-scores-key", default="scores", help="Key used when --external-scores points to an .npz file.")
     return parser.parse_args()
@@ -159,6 +183,8 @@ def empty_summary_row(
         "registration_rmse": "",
         "latency_mean_ms": "",
         "latency_p95_ms": "",
+        "target_index_build_ms": "",
+        "cold_start_latency_ms": "",
         "memory_mb": "",
         "map_size_mb": "",
         "backend": registration_cfg.get("backend", ""),
@@ -166,7 +192,9 @@ def empty_summary_row(
         "max_corr_dist": registration_cfg.get("max_correspondence_distance", ""),
         "init_mode": registration_cfg.get("init_mode", ""),
         "seed": config.get("seed", ""),
+        "fps_candidate_cap": "",
         "score_source": "",
+        **{key: "" for key in SUMMARY_ALL_FIELDS if key.startswith("reserve_corr_")},
     }
 
 
@@ -206,9 +234,14 @@ def _summary_from_outputs(
             "rpe_rmse": localize_summary.get("rpe_trans_rmse", ""),
             "latency_mean_ms": localize_summary.get("latency_mean_ms", ""),
             "latency_p95_ms": localize_summary.get("latency_p95_ms", ""),
+            "target_index_build_ms": localize_summary.get("target_index_build_ms", ""),
+            "cold_start_latency_ms": localize_summary.get("cold_start_latency_ms", ""),
             "map_size_mb": f"{map_path.stat().st_size / (1024 * 1024):.12g}" if map_path.exists() else "",
         }
     )
+    for key in SUMMARY_ALL_FIELDS:
+        if key.startswith("reserve_corr_"):
+            row[key] = localize_summary.get(key, "")
     frame_metrics = Path(task["localize_dir"]) / "frame_metrics.csv"
     if frame_metrics.exists():
         with open(frame_metrics, newline="") as f:
@@ -234,11 +267,14 @@ def run_eval(
     fisher_seed: int | None = None,
     external_scores_path: str | None = None,
     external_scores_key: str = "scores",
+    seed: int | None = None,
+    fps_candidate_cap: int | None = 20000,
 ) -> dict[str, Any]:
     config = load_config(config_path)
     strategies = strategies or config.get("fsm", {}).get("strategies", ["full"])
     compression_ratios = compression_ratios or config.get("fsm", {}).get("compression_ratios", [1.0])
-    fisher_seed = int(config.get("seed", 0)) + 10007 if fisher_seed is None else int(fisher_seed)
+    pruning_seed = int(config.get("seed", 0)) if seed is None else int(seed)
+    fisher_seed = pruning_seed + 10007 if fisher_seed is None else int(fisher_seed)
     external_scores = load_external_scores(external_scores_path, key=external_scores_key) if external_scores_path else None
 
     output_root = Path(output_dir)
@@ -258,7 +294,8 @@ def run_eval(
         strategies=strategies,
         compression_ratios=compression_ratios,
         external_scores=external_scores,
-        seed=int(config.get("seed", 0)),
+        seed=pruning_seed,
+        fps_candidate_cap=fps_candidate_cap,
         overwrite=overwrite,
     )
     export_by_map = {row["map_path"]: row for row in export_rows}
@@ -310,6 +347,8 @@ def run_eval(
             )
         )
         summary_rows[-1]["score_source"] = external_scores_path or ""
+        summary_rows[-1]["seed"] = pruning_seed
+        summary_rows[-1]["fps_candidate_cap"] = "" if fps_candidate_cap is None else fps_candidate_cap
 
     _write_csv(output_root / "summary_all.csv", SUMMARY_ALL_FIELDS, summary_rows)
     return {"tasks": task_plan, "summary_rows": summary_rows, "dry_run": False}
@@ -332,6 +371,8 @@ def main() -> None:
         fisher_seed=args.fisher_seed,
         external_scores_path=args.external_scores,
         external_scores_key=args.external_scores_key,
+        seed=args.seed,
+        fps_candidate_cap=None if args.fps_candidate_cap == 0 else args.fps_candidate_cap,
     )
     mode = "planned" if result["dry_run"] else "completed"
     print(f"FSM eval {mode}: {len(result['tasks'])} tasks, output={args.output_dir}")
