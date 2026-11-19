@@ -91,6 +91,85 @@ def organized_depth_source_normals(
     return normals, valid, np.clip(confidence, 0.0, 1.0)
 
 
+def normalized_hessian_diagnostics(
+    hessian_world: np.ndarray,
+    reference_pose: np.ndarray,
+    source_points_camera: np.ndarray | None = None,
+    characteristic_length: float | None = None,
+) -> dict[str, Any]:
+    """Diagnose a world Hessian in depth-normalized reference-camera coordinates.
+
+    Twists are ordered [rotation, translation]. Length defaults to the median
+    positive camera depth clipped to [0.5, 5.0], or 1.0 without positive depths.
+    An explicit finite positive length is used unchanged, allowing comparisons
+    with a shared reference and scale. Rank uses 6 * eps * lambda_max; singular
+    matrices have infinite condition number and zero trace has lambda/trace 0.
+    Negative eigenvalues within 64 * eps * spectral scale are roundoff-clipped.
+    """
+    hessian = np.asarray(hessian_world, dtype=np.float64)
+    pose = np.asarray(reference_pose, dtype=np.float64)
+    if hessian.shape != (6, 6) or np.any(~np.isfinite(hessian)):
+        raise ValueError("hessian_world must be a finite 6x6 matrix")
+    if pose.shape != (4, 4) or np.any(~np.isfinite(pose)):
+        raise ValueError("reference_pose must be a finite 4x4 rigid transform")
+    rotation = pose[:3, :3]
+    if (not np.allclose(pose[3], [0.0, 0.0, 0.0, 1.0], rtol=0.0, atol=1e-8)
+            or not np.allclose(rotation.T @ rotation, np.eye(3), rtol=0.0, atol=1e-6)
+            or not np.isclose(np.linalg.det(rotation), 1.0, rtol=0.0, atol=1e-6)):
+        raise ValueError("reference_pose must be a rigid transform with a proper rotation")
+    median_depth = 1.0
+    if source_points_camera is not None:
+        points = np.asarray(source_points_camera, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 3 or np.any(~np.isfinite(points)):
+            raise ValueError("source_points_camera must be finite with shape [N, 3]")
+        valid_depth = points[:, 2][points[:, 2] > 0.0]
+        if valid_depth.size:
+            median_depth = float(np.median(valid_depth))
+    if characteristic_length is None:
+        length = float(np.clip(median_depth, 0.5, 5.0))
+    else:
+        value = np.asarray(characteristic_length, dtype=np.float64)
+        if value.ndim != 0 or not np.isfinite(value) or value <= 0.0:
+            raise ValueError("characteristic_length must be a finite positive scalar")
+        length = float(value)
+
+    _, _, adjoint = _camera_geometry(pose)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        symmetric = 0.5 * (hessian + hessian.T)
+        camera_hessian = adjoint.T @ symmetric @ adjoint
+        coordinate_map = np.diag([1.0 / length] * 3 + [1.0] * 3)
+        normalized_hessian = coordinate_map.T @ camera_hessian @ coordinate_map
+        normalized_hessian = 0.5 * (normalized_hessian + normalized_hessian.T)
+    if np.any(~np.isfinite(normalized_hessian)):
+        raise ValueError("normalized hessian must be finite")
+    try:
+        eigenvalues, eigenvectors = np.linalg.eigh(normalized_hessian)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("normalized hessian eigendecomposition failed") from exc
+    if np.any(~np.isfinite(eigenvalues)):
+        raise ValueError("normalized hessian eigenvalues must be finite")
+    spectral_scale = float(np.max(np.abs(eigenvalues)))
+    if eigenvalues[0] < -64.0 * np.finfo(np.float64).eps * spectral_scale:
+        raise ValueError("hessian_world must be positive semidefinite")
+    eigenvalues = np.maximum(eigenvalues, 0.0)
+    rank_threshold = 6.0 * np.finfo(np.float64).eps * float(eigenvalues[-1])
+    rank = int(np.count_nonzero(eigenvalues > rank_threshold))
+    # Scale before summation to avoid overflowing the trace of finite spectra.
+    scaled = eigenvalues / eigenvalues[-1] if eigenvalues[-1] > 0.0 else eigenvalues
+    return {
+        "hessian": normalized_hessian,
+        "eigenvalues": eigenvalues,
+        "condition_number": float(eigenvalues[-1] / eigenvalues[0]) if rank == 6 else float("inf"),
+        "effective_rank": rank,
+        "characteristic_length": length,
+        "normalized_lambda_min": float(scaled[0] / np.sum(scaled)) if rank > 0 else 0.0,
+        "eigenvectors": eigenvectors,
+        "camera_hessian": camera_hessian,
+        "adjoint_c2w": adjoint,
+        "coordinate_map": coordinate_map,
+    }
+
+
 def adaptive_weak_subspace(
     hessian_world: np.ndarray,
     c2w: np.ndarray,
@@ -103,28 +182,23 @@ def adaptive_weak_subspace(
     characteristic_depth_max: float = 5.0,
 ) -> dict[str, Any]:
     """Return an adaptive weak eigenspace in depth-normalized camera twist coordinates."""
-    hessian = np.asarray(hessian_world, dtype=np.float64)
     points = np.asarray(source_points_camera, dtype=np.float64)
-    if hessian.shape != (6, 6) or np.any(~np.isfinite(hessian)):
-        raise ValueError("hessian_world must be a finite 6x6 matrix")
-    if points.ndim != 2 or points.shape[1] != 3:
-        raise ValueError("source_points_camera must have shape [N, 3]")
+    if points.ndim != 2 or points.shape[1] != 3 or np.any(~np.isfinite(points)):
+        raise ValueError("source_points_camera must be finite with shape [N, 3]")
     if not 1 <= int(min_dim) <= int(max_dim) <= 3:
         raise ValueError("weak dimensions must satisfy 1 <= min_dim <= max_dim <= 3")
     if trace_threshold <= 0.0 or relative_threshold <= 0.0:
         raise ValueError("weak thresholds must be positive")
+    if (not np.isfinite(characteristic_depth_min) or not np.isfinite(characteristic_depth_max)
+            or not 0.0 < characteristic_depth_min <= characteristic_depth_max):
+        raise ValueError("characteristic depth bounds must be finite, positive and ordered")
     valid_depth = points[:, 2][np.isfinite(points[:, 2]) & (points[:, 2] > 0.0)]
     median_depth = float(np.median(valid_depth)) if valid_depth.size else 1.0
     length = float(np.clip(median_depth, characteristic_depth_min, characteristic_depth_max))
 
-    _, _, adjoint = _camera_geometry(c2w)
-    symmetric = 0.5 * (hessian + hessian.T)
-    camera_hessian = adjoint.T @ symmetric @ adjoint
-    coordinate_map = np.diag([1.0 / length] * 3 + [1.0] * 3)
-    normalized_hessian = coordinate_map.T @ camera_hessian @ coordinate_map
-    normalized_hessian = 0.5 * (normalized_hessian + normalized_hessian.T)
-    eigenvalues, eigenvectors = np.linalg.eigh(normalized_hessian)
-    eigenvalues = np.maximum(eigenvalues, 0.0)
+    diagnostics = normalized_hessian_diagnostics(hessian_world, c2w, points, length)
+    eigenvalues = diagnostics["eigenvalues"]
+    eigenvectors = diagnostics["eigenvectors"]
     trace = max(float(np.sum(eigenvalues)), np.finfo(np.float64).eps)
     threshold = max(float(trace_threshold) * trace, float(relative_threshold) * float(eigenvalues[-1]))
     requested = int(np.count_nonzero(eigenvalues < threshold))
@@ -142,10 +216,10 @@ def adaptive_weak_subspace(
         "characteristic_length": length,
         "threshold": threshold,
         "truncated": bool(requested > max_dim),
-        "camera_hessian": camera_hessian,
-        "normalized_hessian": normalized_hessian,
-        "adjoint_c2w": adjoint,
-        "coordinate_map": coordinate_map,
+        "camera_hessian": diagnostics["camera_hessian"],
+        "normalized_hessian": diagnostics["hessian"],
+        "adjoint_c2w": diagnostics["adjoint_c2w"],
+        "coordinate_map": diagnostics["coordinate_map"],
     }
 
 

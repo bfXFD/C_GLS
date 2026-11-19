@@ -11,9 +11,11 @@ from utils.fsm_map import (
     build_fsm_map,
     expand_log_scales,
     fsm_map_field_sizes,
+    export_runtime_reserve_geometry,
     gaussians_to_covariances,
     load_fsm_map,
     load_activation_geometry,
+    load_runtime_reserve_geometry,
     load_splatam_params,
     normalize_quaternions,
     quaternions_to_rotation_matrices,
@@ -265,6 +267,30 @@ class TestFsmMap(unittest.TestCase):
                 path, fsm_map, source_params_sha256="a" * 64, selection_controls_sha256="b" * 64
             )
         np.testing.assert_array_equal(loaded["selected_global_ids"], fsm_map["indices"])
+
+    def test_runtime_reserve_export_preserves_geometry_and_rejects_wrong_map(self):
+        params = make_params(num_gaussians=5)
+        fsm_map = build_fsm_map(params, indices=np.array([4, 3, 1], dtype=np.int64))
+        fsm_map.update(source_params_sha256=np.asarray("a" * 64), selection_controls_sha256=np.asarray("b" * 64))
+        geometry = make_activation_geometry(params, fsm_map)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old, new = (os.path.join(tmpdir, name) for name in ("audit.npz", "runtime.npz"))
+            np.savez(old, **geometry)
+            export_runtime_reserve_geometry(old, fsm_map, new)
+            with self.assertRaises(FileExistsError):
+                export_runtime_reserve_geometry(old, fsm_map, new)
+            loaded = load_runtime_reserve_geometry(new, fsm_map)
+            self.assertNotIn("selected_global_ids", loaded)
+            for key in ("reserve_global_ids", "reserve_means", "reserve_normals", "reserve_scores", "reserve_covariances"):
+                self.assertEqual(loaded[key].dtype, geometry[key].dtype)
+                np.testing.assert_array_equal(loaded[key], geometry[key])
+            with self.assertRaisesRegex(ValueError, "indices and order"):
+                load_runtime_reserve_geometry(new, dict(fsm_map, indices=np.array([3, 4, 1])))
+            with self.assertRaisesRegex(ValueError, "source_params_sha256"):
+                load_runtime_reserve_geometry(new, dict(fsm_map, source_params_sha256=np.asarray("c" * 64)))
+            np.savez(new, **dict(loaded, reserve_global_ids=np.array([4], dtype=np.int64)))
+            with self.assertRaisesRegex(ValueError, "overlaps"):
+                load_runtime_reserve_geometry(new, fsm_map)
 
     def test_activation_geometry_rejects_id_and_hash_mismatches(self):
         params = make_params(num_gaussians=5)

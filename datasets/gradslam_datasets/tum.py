@@ -24,10 +24,15 @@ class TUMDataset(GradSLAMDataset):
         load_embeddings: Optional[bool] = False,
         embedding_dir: Optional[str] = "embeddings",
         embedding_dim: Optional[int] = 512,
+        pose_reference_sequence: Optional[str] = None,
         **kwargs,
     ):
         self.input_folder = os.path.join(basedir, sequence)
         self.pose_path = None
+        self.pose_reference_sequence = pose_reference_sequence
+        self.pose_reference_transform = None
+        self.pose_reference_map0_abs = None
+        self.pose_reference_query0_abs = None
         super().__init__(
             config_dict,
             stride=stride,
@@ -40,6 +45,19 @@ class TUMDataset(GradSLAMDataset):
             embedding_dim=embedding_dim,
             **kwargs,
         )
+        if self.pose_reference_sequence is not None:
+            reference_folder = os.path.join(basedir, self.pose_reference_sequence)
+            map0_abs = self._first_associated_pose(reference_folder)
+            query0_abs = torch.from_numpy(self._first_associated_pose(self.input_folder)).to(dtype=torch.float64)
+            map0_abs = torch.from_numpy(map0_abs).to(dtype=torch.float64)
+            transform = torch.linalg.inv(map0_abs) @ query0_abs
+            if self.relative_pose:
+                self.transformed_poses = transform.to(self.transformed_poses) @ self.transformed_poses
+            else:
+                self.transformed_poses = torch.linalg.inv(map0_abs).to(self.transformed_poses) @ self.transformed_poses
+            self.pose_reference_transform = transform.cpu().numpy()
+            self.pose_reference_map0_abs = map0_abs.cpu().numpy()
+            self.pose_reference_query0_abs = query0_abs.cpu().numpy()
 
     def parse_list(self, filepath, skiprows=0):
         """ read list data """
@@ -74,6 +92,22 @@ class TUMDataset(GradSLAMDataset):
         pose[:3, :3] = Rotation.from_quat(pvec[3:]).as_matrix()
         pose[:3, 3] = pvec[:3]
         return pose
+
+    def _first_associated_pose(self, input_folder):
+        pose_list = os.path.join(input_folder, 'groundtruth.txt')
+        if not os.path.isfile(pose_list):
+            pose_list = os.path.join(input_folder, 'pose.txt')
+        image_data = self.parse_list(os.path.join(input_folder, 'rgb.txt'))
+        depth_data = self.parse_list(os.path.join(input_folder, 'depth.txt'))
+        pose_data = self.parse_list(pose_list, skiprows=1)
+        associations = self.associate_frames(
+            image_data[:, 0].astype(np.float64),
+            depth_data[:, 0].astype(np.float64),
+            pose_data[:, 0].astype(np.float64),
+        )
+        if not associations:
+            raise ValueError(f"No associated RGB-D/GT frames in {input_folder}")
+        return self.pose_matrix_from_quaternion(pose_data[associations[0][2], 1:].astype(np.float64))
 
     def get_filepaths(self):
 

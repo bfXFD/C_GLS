@@ -5,6 +5,8 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable, Iterable
+from copy import copy
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from typing import Any
@@ -25,12 +27,18 @@ from utils.fsm_final_target_oracle import FinalTargetOracleConfig, FinalTargetOr
 from utils.fsm_paired_reserve import BaselineSnapshot, PairedShadowReserve
 from utils.fsm_registration import build_target_index, compose_transform, register_pointcloud
 from utils.fsm_robust_registration import estimate_normals
+from utils.fsm_robust_registration import se3_exp
+from utils.fsm_candidate_verification import (
+    FrozenCandidateVerifier, VERIFIER_METRIC_FIELDS, split_source_validation,
+    validate_verifier_config,
+)
 from utils.fsm_runtime_memory import get_process_memory_mb
 from utils.fsm_runtime_reserve import (
     RuntimeObservableReserve,
     RuntimeReserveObservation,
     evaluate_common_target_pose,
     relative_se3_log,
+    se3_log,
 )
 
 
@@ -287,6 +295,15 @@ STRICT_FRAME_METRIC_FIELDS = AUDIT_FRAME_METRIC_FIELDS + [
     "peak_rss_mb",
 ]
 
+STRICT_FRAME_METRIC_FIELDS += list(VERIFIER_METRIC_FIELDS) + [
+    "reserve_verifier_latency_ms", "reserve_candidate_target_mode",
+    "reserve_candidate_base_removed", "reserve_candidate_target_count",
+    "reserve_spectral_coordinates", "reserve_spectral_length",
+    "reserve_spectral_primary_lambda", "reserve_spectral_candidate_lambda",
+    "reserve_spectral_primary_condition", "reserve_spectral_candidate_condition",
+    "source_training_count", "source_validation_count",
+]
+
 EVALUATION_PROTOCOLS = ("audit_legacy", "mvp_strict")
 FIRST_POSE_PROTOCOLS = ("gt_first_frame", "identity", "explicit")
 FROZEN_AUDIT_DIRNAME = "audit_v2_full_rerun"
@@ -535,19 +552,76 @@ def _strict_first_pose(
     first_pose_protocol: str,
     gt_pose: np.ndarray,
     explicit_initial_pose: np.ndarray | None,
+    first_pose_left_twist: np.ndarray | None = None,
 ) -> np.ndarray:
     if first_pose_protocol == "gt_first_frame":
-        return gt_pose.astype(np.float64)
-    if first_pose_protocol == "identity":
-        return np.eye(4, dtype=np.float64)
-    if first_pose_protocol == "explicit":
+        pose = gt_pose.astype(np.float64)
+    elif first_pose_protocol == "identity":
+        pose = np.eye(4, dtype=np.float64)
+    elif first_pose_protocol == "explicit":
         if explicit_initial_pose is None:
             raise ValueError("mvp_strict with first_pose_protocol='explicit' requires an explicit initial pose")
         pose = np.asarray(explicit_initial_pose, dtype=np.float64)
         if not _is_finite_pose(pose, float("inf")):
             raise ValueError("explicit_initial_pose must be a finite 4x4 transform")
-        return pose.copy()
-    raise ValueError(f"Unknown first_pose_protocol '{first_pose_protocol}'")
+        pose = pose.copy()
+    else:
+        raise ValueError(f"Unknown first_pose_protocol '{first_pose_protocol}'")
+    if first_pose_left_twist is not None:
+        twist = np.asarray(first_pose_left_twist, dtype=np.float64)
+        if twist.shape != (6,) or np.any(~np.isfinite(twist)):
+            raise ValueError("registration.first_pose_left_twist must contain six finite values")
+        pose = se3_exp(twist) @ pose
+    return pose
+
+
+def _stable_replacement_positions(global_ids: np.ndarray, count: int, seed: int) -> np.ndarray:
+    ids = np.asarray(global_ids, dtype=np.int64).reshape(-1)
+    count = min(max(int(count), 0), ids.size)
+    if count == 0:
+        return np.empty(0, dtype=np.int64)
+    unsigned = ids.astype(np.uint64, copy=False)
+    keys = unsigned ^ np.uint64(int(seed) & ((1 << 64) - 1))
+    keys ^= keys >> np.uint64(30)
+    keys *= np.uint64(0xBF58476D1CE4E5B9)
+    keys ^= keys >> np.uint64(27)
+    keys *= np.uint64(0x94D049BB133111EB)
+    keys ^= keys >> np.uint64(31)
+    return np.lexsort((ids, keys))[:count].astype(np.int64)
+
+
+def _candidate_target_arrays(
+    *,
+    mode: str,
+    base_points: np.ndarray,
+    base_covariances: np.ndarray | None,
+    base_normals: np.ndarray | None,
+    base_global_ids: np.ndarray,
+    reserve_points: np.ndarray,
+    reserve_covariances: np.ndarray | None,
+    reserve_normals: np.ndarray,
+    replacement_seed: int,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, int]:
+    if mode == "rerun_primary":
+        return base_points.copy(), None if base_covariances is None else base_covariances.copy(), (
+            None if base_normals is None else base_normals.copy()
+        ), 0
+    keep = np.ones(base_points.shape[0], dtype=bool)
+    removed = 0
+    if mode == "replace":
+        positions = _stable_replacement_positions(base_global_ids, reserve_points.shape[0], replacement_seed)
+        keep[positions] = False
+        removed = int(positions.size)
+    elif mode != "append":
+        raise ValueError(f"Unknown candidate target mode {mode!r}")
+    points = np.concatenate([base_points[keep], reserve_points], axis=0)
+    covariances = None
+    if base_covariances is not None and reserve_covariances is not None:
+        covariances = np.concatenate([base_covariances[keep], reserve_covariances], axis=0)
+    normals = None
+    if base_normals is not None:
+        normals = np.concatenate([base_normals[keep], reserve_normals], axis=0)
+    return points, covariances, normals, removed
 
 
 def _rotation_angle_deg(rotation: np.ndarray) -> float:
@@ -746,6 +820,7 @@ def _recovery_local_config(
         radius_margin=base.radius_margin * float(recovery_cfg.get("radius_multiplier", 2.0)),
         max_points=max_points,
         sampling_policy=base.sampling_policy,
+        coverage_representatives=base.coverage_representatives,
         tile_rows=base.tile_rows,
         tile_cols=base.tile_cols,
         depth_bins=base.depth_bins,
@@ -772,13 +847,14 @@ def _query_recovery_target(
     tier: int,
     recovery_cfg: dict[str, Any],
     return_stage_indices: bool = False,
+    use_local_map_scores: bool = True,
 ) -> dict[str, Any]:
     if tier < 3:
         query_config = base_config if tier < 2 else _recovery_local_config(base_config, recovery_cfg)
         query_kwargs = (
             {"block_score_token": block_score_token}
             if block_score_token is not None and query_config.frustum_culling == "voxel_blocks"
-            else {"scores": scores}
+            else {"scores": scores if use_local_map_scores else None}
         )
         if return_stage_indices:
             query_kwargs["return_stage_indices"] = True
@@ -961,7 +1037,29 @@ def run_localization(
     first_pose_protocol_override: str | None = None,
     motion_model_override: str | None = None,
     explicit_initial_pose: np.ndarray | None = None,
+    stage_profile=None,
+    *,
+    candidate_probe: Callable[[dict[str, Any]], None] | None = None,
+    candidate_force_frames: Iterable[int] | None = None,
+    reserve_stop_source_idx: int | None = None,
+    primary_observer: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    """Localize, optionally reporting one reserve arm against the unmodified base trajectory.
+
+    Probe runs must start at source index zero and use identical base settings
+    (including the verifier's source holdout) across arms. Forced frame IDs only
+    request diagnostic solves; they do not override eligibility or native adoption.
+    """
+    probe_enabled = candidate_probe is not None
+    if reserve_stop_source_idx is not None and (
+        type(reserve_stop_source_idx) is not int or reserve_stop_source_idx < 1 or probe_enabled
+    ):
+        raise ValueError("reserve_stop_source_idx requires a positive integer and no candidate_probe")
+    if probe_enabled and not callable(candidate_probe):
+        raise TypeError("candidate_probe must be callable")
+    force_frames = frozenset(() if candidate_force_frames is None else candidate_force_frames)
+    if candidate_force_frames is not None and not probe_enabled:
+        raise ValueError("candidate_force_frames requires candidate_probe")
     fsm_map = load_fsm_map(map_path)
     target_points = np.asarray(fsm_map["means"], dtype=np.float64)
     target_covariances = np.asarray(fsm_map["covariances"], dtype=np.float64) if "covariances" in fsm_map else None
@@ -982,11 +1080,36 @@ def run_localization(
 
     if len(frame_ids) == 0:
         raise ValueError("No frames selected for localization")
+    if probe_enabled and frame_ids.start != 0:
+        raise ValueError("candidate_probe requires replay from source index 0")
 
     output_root = Path(output_dir)
 
     registration_cfg = config.get("registration", {})
     dataset_cfg = config.get("dataset", {})
+    reserve_cfg = config.get("observable_reserve", {})
+    bypass_candidate_gate = reserve_cfg.get("bypass_candidate_gate", False)
+    if not isinstance(bypass_candidate_gate, bool):
+        raise ValueError("observable_reserve.bypass_candidate_gate must be boolean")
+    if bypass_candidate_gate and probe_enabled:
+        raise ValueError("bypass_candidate_gate is closed-loop only; candidate_probe already reports both outcomes")
+    verifier_cfg = reserve_cfg.get("candidate_verifier", {})
+    if not isinstance(verifier_cfg, dict) or not isinstance(verifier_cfg.get("enabled", False), bool):
+        raise ValueError("candidate_verifier must be a dictionary with boolean enabled")
+    verifier_enabled = verifier_cfg.get("enabled", False)
+    verifier_options = {
+        key: value for key, value in verifier_cfg.items()
+        if key not in ("enabled", "block_size", "folds", "fold", "max_translation_m")
+    }
+    if "max_translation_m" in verifier_cfg:
+        verifier_options["max_translation"] = verifier_cfg["max_translation_m"]
+    if verifier_enabled:
+        verifier_options = validate_verifier_config(verifier_options)
+        split_source_validation(
+            np.empty(0, dtype=np.int64), 1,
+            block_size=verifier_cfg.get("block_size", 16),
+            folds=verifier_cfg.get("folds", 4), fold=verifier_cfg.get("fold", 0),
+        )
     eval_cfg = config.get("eval", {})
     memory_cfg = config.get("runtime_memory_metrics", {}) or {}
     if not isinstance(memory_cfg, dict):
@@ -995,7 +1118,12 @@ def run_localization(
     evaluation_protocol = protocol_override or registration_cfg.get("evaluation_protocol", "audit_legacy")
     if evaluation_protocol not in EVALUATION_PROTOCOLS:
         raise ValueError(f"Unknown evaluation_protocol '{evaluation_protocol}'")
+    if probe_enabled and evaluation_protocol != "mvp_strict":
+        raise ValueError("candidate_probe requires mvp_strict")
+    if verifier_enabled and (evaluation_protocol != "mvp_strict" or backend != "numpy_robust_point_to_plane"):
+        raise ValueError("candidate_verifier requires strict robust point-to-plane registration")
     first_pose_protocol = first_pose_protocol_override or registration_cfg.get("first_pose_protocol")
+    first_pose_left_twist = registration_cfg.get("first_pose_left_twist")
     motion_cfg = config.get("motion_model", {})
     if isinstance(motion_cfg, str):
         configured_motion_model = motion_cfg
@@ -1058,6 +1186,9 @@ def run_localization(
         raise ValueError("prediction motion guard thresholds must be non-negative")
 
     local_cfg = config.get("local_submap", registration_cfg.get("local_submap", {}))
+    use_local_map_scores = local_cfg.get("use_map_scores", True)
+    if not isinstance(use_local_map_scores, bool):
+        raise ValueError("local_submap.use_map_scores must be boolean")
     local_enabled = bool(local_cfg.get("enabled", False))
     if local_enabled and evaluation_protocol != "mvp_strict":
         raise ValueError("local_submap is only supported with evaluation_protocol='mvp_strict'")
@@ -1080,6 +1211,7 @@ def run_localization(
             radius_margin=float(local_cfg.get("radius_margin", 0.0)),
             max_points=local_cfg.get("max_points"),
             sampling_policy=str(local_cfg.get("sampling_policy", "legacy")),
+            coverage_representatives=str(local_cfg.get("coverage_representatives", "ranked")),
             tile_rows=int(local_cfg.get("tile_rows", 12)),
             tile_cols=int(local_cfg.get("tile_cols", 16)),
             depth_bins=int(local_cfg.get("depth_bins", 8)),
@@ -1105,7 +1237,9 @@ def run_localization(
         local_index_build_ms = local_spatial_index.build_latency_ms
         local_index_backend = local_spatial_index.backend
         if local_config.frustum_culling == "voxel_blocks":
-            block_metrics = local_spatial_index.prebuild_blocks(local_config.block_size_m, target_scores)
+            block_metrics = local_spatial_index.prebuild_blocks(
+                local_config.block_size_m, target_scores if use_local_map_scores else None,
+            )
             block_index_build_ms = float(block_metrics["block_index_build_ms"])
             block_score_hash_ms = float(block_metrics["block_score_hash_ms"])
             block_geometry_sort_ms = float(block_metrics["block_geometry_sort_ms"])
@@ -1160,6 +1294,15 @@ def run_localization(
     observable_reserve = RuntimeObservableReserve(
         config, fsm_map, map_path, local_config, evaluation_protocol, backend,
     )
+    if bypass_candidate_gate or force_frames:
+        if not observable_reserve.active or observable_reserve.mode != "active":
+            raise ValueError("candidate bypass or force frames require active observable_reserve")
+    force_reserve = None
+    if force_frames:
+        # Reuse the same selection policy and mandatory runtime eligibility checks.
+        # Only the diagnostic planner's trigger threshold differs.
+        force_reserve = copy(observable_reserve)
+        force_reserve.trigger = {"iterations": 0, "effective_rank_below": None}
     selection_event_writer = _ReserveSelectionEventWriter(output_root, config, observable_reserve, map_path)
     paired_cfg = config.get("paired_reserve_evaluation", {}) or {}
     if not isinstance(paired_cfg, dict):
@@ -1201,13 +1344,15 @@ def run_localization(
         runtime_fields = {key: value for key, value in oracle_cfg.items() if key != "enabled"}
         final_target_oracle = FinalTargetOracleRuntime(
             FinalTargetOracleConfig(**runtime_fields), local_spatial_index, local_config,
-            scores=None if block_score_token is not None else target_scores,
+            scores=None if block_score_token is not None or not use_local_map_scores else target_scores,
             block_score_token=block_score_token,
         )
 
     for output_idx, source_idx in enumerate(frame_ids):
         frame_start = time.perf_counter()
         frame = get_frame(frame_source, source_idx) if dataset is not None and frames is None else frame_source[source_idx]
+        stages = ({"frame_load_ms": (time.perf_counter() - frame_start) * 1000, "attempts": []}
+                  if stage_profile is not None else None)
         frame_id = int(frame.get("frame_id", output_idx))
         timestamp = float(frame.get("timestamp", frame_id))
         gt_c2w = np.asarray(frame["c2w"], dtype=np.float64)
@@ -1216,7 +1361,14 @@ def run_localization(
         pair_id = ""
         paired_arm_count = 0
         paired_shadow_latency_ms = 0.0
+        candidate_pose = None
+        candidate_basic_valid = False
+        candidate_reserve_count = candidate_target_count = candidate_latency_ms = None
+        force_requested = frame_id in force_frames
+        force_eligible = forced_attempt = False
+        probe_latency_ms = 0.0
 
+        stage_start = time.perf_counter() if stages is not None else 0.0
         pointcloud = rgbd_to_pointcloud(
             color=frame.get("color"),
             depth=frame["depth"],
@@ -1227,9 +1379,36 @@ def run_localization(
             max_points=dataset_cfg.get("max_points"),
             seed=int(config.get("seed", 0)) + frame_id,
         )
+        if stages is not None:
+            stages["pointcloud_ms"] = (time.perf_counter() - stage_start) * 1000
+        validation_points = np.empty((0, 3), dtype=np.float64)
+        validation_groups = np.empty(0, dtype=np.int64)
+        selection_depth = np.asarray(frame["depth"], dtype=np.float64)
+        if verifier_enabled:
+            width = np.asarray(frame["depth"]).shape[1]
+            validation_mask = split_source_validation(
+                pointcloud["indices"], width,
+                block_size=verifier_cfg.get("block_size", 16),
+                folds=verifier_cfg.get("folds", 4), fold=verifier_cfg.get("fold", 0),
+            )
+            validation_points = np.asarray(pointcloud["points"][validation_mask], dtype=np.float64).copy()
+            pixels = pointcloud["indices"][validation_mask]
+            block = verifier_cfg.get("block_size", 16)
+            validation_groups = (pixels // width // block) * ((width + block - 1) // block) + pixels % width // block
+            selection_depth = selection_depth.copy()
+            heldout_pixels = split_source_validation(
+                np.arange(selection_depth.size, dtype=np.int64), width,
+                block_size=block, folds=verifier_cfg.get("folds", 4), fold=verifier_cfg.get("fold", 0),
+            )
+            selection_depth.reshape(-1)[heldout_pixels] = 0.0
+            for key in ("points", "indices", "colors"):
+                if pointcloud.get(key) is not None:
+                    pointcloud[key] = pointcloud[key][~validation_mask]
 
         if evaluation_protocol == "mvp_strict" and output_idx == 0:
-            estimated_c2w = _strict_first_pose(first_pose_protocol, gt_c2w, explicit_initial_pose)
+            estimated_c2w = _strict_first_pose(
+                first_pose_protocol, gt_c2w, explicit_initial_pose, first_pose_left_twist
+            )
             result = {
                 "transform": estimated_c2w,
                 "fitness": 1.0,
@@ -1353,6 +1532,15 @@ def run_localization(
                 attempt_pose: np.ndarray, tier: int, attempt_backend: str | None = None
             ) -> tuple[dict[str, Any], dict[str, Any]]:
                 nonlocal previous_local_indices, previous_local_tree, previous_local_normals, final_attempt_context
+                stage = None
+                if stages is not None:
+                    stage = {"tier": tier, "backend": attempt_backend or backend,
+                             "same_query_as_earlier_attempt": any(
+                                 old["query_kind"] == min(max(old["tier"], 1), 3)
+                                 == min(max(tier, 1), 3) and old["query_pose"] == attempt_pose.tolist()
+                                 for old in stages["attempts"]),
+                             "query_kind": min(max(tier, 1), 3), "query_pose": attempt_pose.tolist()}
+                    stages["attempts"].append(stage)
                 registration_target_points = target_points
                 registration_target_covariances = target_covariances
                 registration_target_normals = target_normals
@@ -1411,6 +1599,7 @@ def run_localization(
                 if local_enabled:
                     assert local_spatial_index is not None and local_config is not None
                     image_height, image_width = np.asarray(frame["depth"]).shape[:2]
+                    stage_start = time.perf_counter() if stage is not None else 0.0
                     local_query = _query_recovery_target(
                         local_spatial_index,
                         attempt_pose,
@@ -1422,7 +1611,10 @@ def run_localization(
                         block_score_token,
                         tier,
                         recovery_cfg,
+                        use_local_map_scores=use_local_map_scores,
                     )
+                    if stage is not None:
+                        stage["query_ms"] = (time.perf_counter() - stage_start) * 1000
                     local_indices = np.asarray(local_query["indices"], dtype=np.int64)
                     query_metrics = {
                         "query_latency_ms": float(local_query["query_latency_ms"]),
@@ -1501,18 +1693,38 @@ def run_localization(
                         return _registration_failure(
                             attempt_pose, pointcloud["points"].shape[0], local_indices.size, reason
                         ), query_metrics
+                    stage_start = time.perf_counter() if stage is not None else 0.0
                     registration_target_points = target_points[local_indices]
                     registration_target_covariances = target_covariances[local_indices] if target_covariances is not None else None
                     registration_target_normals = target_normals[local_indices] if target_normals is not None else None
                     same_local_target = previous_local_indices is not None and np.array_equal(local_indices, previous_local_indices)
+                    if stage is not None:
+                        stage["gather_ms"] = (time.perf_counter() - stage_start) * 1000
+                        stage["tree_reused"] = same_local_target
+                        stage_start = time.perf_counter()
                     registration_target_tree = previous_local_tree if same_local_target else build_target_index(registration_target_points)["target_tree"]
+                    if stage is not None:
+                        stage["tree_ms"] = (time.perf_counter() - stage_start) * 1000
 
                 selected_backend = attempt_backend or backend
+                if verifier_enabled and pointcloud["points"].shape[0] < int(registration_cfg.get("min_correspondences", 6)):
+                    return _registration_failure(
+                        attempt_pose, pointcloud["points"].shape[0], registration_target_points.shape[0],
+                        "insufficient_training_source",
+                    ), query_metrics
                 if normal_source in ("estimate", "local_pca") and selected_backend != "numpy_point_to_point":
                     registration_target_normals = None
+                stage_start = time.perf_counter() if stage is not None else 0.0
+                if verifier_enabled and normal_source == "estimate" and selected_backend != "numpy_point_to_point":
+                    registration_target_normals = estimate_normals(
+                        registration_target_points, k=int(registration_cfg.get("normal_k", 20)),
+                        target_tree=registration_target_tree,
+                    )
                 if normal_source == "local_pca" and selected_backend != "numpy_point_to_point":
                     assert local_indices is not None
                     same_local_target = previous_local_indices is not None and np.array_equal(local_indices, previous_local_indices)
+                    if stage is not None:
+                        stage["normals_reused"] = same_local_target and previous_local_normals is not None
                     if same_local_target and previous_local_normals is not None:
                         registration_target_normals = previous_local_normals
                     else:
@@ -1524,6 +1736,9 @@ def run_localization(
                     previous_local_indices = local_indices.copy()
                     previous_local_tree = registration_target_tree
                     previous_local_normals = registration_target_normals
+                if stage is not None:
+                    stage["normal_prep_ms"] = (time.perf_counter() - stage_start) * 1000
+                    stage_start = time.perf_counter()
 
                 attempt_result = register_pointcloud(
                     source_points=pointcloud["points"],
@@ -1552,6 +1767,8 @@ def run_localization(
                     min_iterations=int(registration_cfg.get("min_iterations", 2)),
                     rank_tolerance=float(registration_cfg.get("rank_tolerance", 1e-9)),
                 )
+                if stage is not None:
+                    stage["registration_ms"] = (time.perf_counter() - stage_start) * 1000
                 final_attempt_context = {
                     "query_pose": np.asarray(attempt_pose, dtype=np.float64).copy(),
                     "query": local_query if local_enabled else None,
@@ -1560,6 +1777,10 @@ def run_localization(
                     "local_indices": None if local_indices is None else local_indices.copy(),
                     "target_tree": registration_target_tree,
                     "target_normals": registration_target_normals,
+                    "target_global_ids": (
+                        target_global_ids.copy()
+                        if local_indices is None else target_global_ids[local_indices].copy()
+                    ),
                 }
                 return attempt_result, query_metrics
 
@@ -1587,6 +1808,12 @@ def run_localization(
                 key: value.copy() if isinstance(value, np.ndarray) else value for key, value in result.items()
             }
             primary_accepted = accepted
+            if primary_observer is not None:
+                primary_observer(dict(
+                    frame_id=frame_id, source_idx=source_idx, initial_pose=init_transform.copy(),
+                    primary_pose=primary_result["transform"].copy(), accepted=primary_accepted,
+                    target_ids=final_attempt_context["target_global_ids"].copy(),
+                ))
             if paired_shadow is not None:
                 assert final_attempt_context is not None
                 primary_normals = final_attempt_context.get("target_normals")
@@ -1640,11 +1867,13 @@ def run_localization(
             )
             reserve_metrics["reserve_primary_accepted"] = primary_accepted
             observable_reserve_attempt = False
-            if observable_reserve.active:
+            probe_start = time.perf_counter() if probe_enabled else 0.0
+            if observable_reserve.active and (reserve_stop_source_idx is None or source_idx < reserve_stop_source_idx):
                 image_height, image_width = np.asarray(frame["depth"]).shape[:2]
                 reserve_observation = None
                 if (
-                    observable_reserve.selection == "runtime_corr_weak"
+                    (observable_reserve.selection == "runtime_corr_weak"
+                     or observable_reserve.spectral_coordinates == "primary_camera_depth")
                     and final_attempt_context is not None
                     and final_attempt_context.get("target_tree") is not None
                 ):
@@ -1653,24 +1882,47 @@ def run_localization(
                     reserve_observation = RuntimeReserveObservation(
                         source_points_camera=np.asarray(pointcloud["points"], dtype=np.float64),
                         source_pixel_ids=np.asarray(pointcloud["indices"], dtype=np.int64),
-                        depth=np.asarray(frame["depth"], dtype=np.float64),
+                        depth=selection_depth,
                         primary_target_tree=final_attempt_context["target_tree"],
                         primary_target_global_ids=np.asarray(primary_target_ids, dtype=np.int64),
                     )
-                reserve_plan = observable_reserve.plan(
+                reserve_plan_args = (
                     frame_id,
                     primary_result,
                     np.asarray(frame["intrinsics"], dtype=np.float64),
                     image_height,
                     image_width,
-                    observation=reserve_observation,
                 )
+                reserve_plan = observable_reserve.plan(*reserve_plan_args, observation=reserve_observation)
+                natural_triggered = bool(reserve_plan.metrics["reserve_triggered"])
+                force_eligible = (
+                    probe_enabled and observable_reserve.mode == "active" and observable_reserve.available
+                    and reserve_plan.metrics["reserve_trigger_unavailable_reason"] is None
+                    and (observable_reserve.selection != "runtime_corr_weak" or reserve_observation is not None)
+                )
+                forced_plan_triggered = False
+                if force_requested and force_eligible and not natural_triggered:
+                    assert force_reserve is not None
+                    forced_plan = force_reserve.plan(*reserve_plan_args, observation=reserve_observation)
+                    forced_plan_triggered = bool(forced_plan.metrics["reserve_triggered"])
+                    forced_plan.metrics.update({
+                        key: reserve_plan.metrics[key] for key in (
+                            "reserve_triggered", "reserve_trigger_reasons", "reserve_trigger_unavailable_reason",
+                        )
+                    })
+                    forced_plan.metrics["reserve_latency_ms"] += reserve_plan.metrics["reserve_latency_ms"]
+                    reserve_plan = forced_plan
                 reserve_metrics = reserve_plan.metrics
                 reserve_metrics["reserve_primary_accepted"] = primary_accepted
-                observable_reserve_attempt = bool(reserve_metrics["reserve_triggered"])
-                if observable_reserve.mode == "active" and reserve_plan.selected_indices.size:
+                observable_reserve_attempt = natural_triggered
+                if observable_reserve.mode == "active" and (
+                    reserve_plan.selected_indices.size or (
+                        observable_reserve.attempt_without_selection and (natural_triggered or forced_plan_triggered)
+                    )
+                ):
                     reserve_metrics["reserve_attempted"] = True
                     observable_reserve_attempt = True
+                    forced_attempt = forced_plan_triggered
                     reserve_start = time.perf_counter()
                     assert final_attempt_context is not None
                     base_points = np.asarray(final_attempt_context["target_points"], dtype=np.float64)
@@ -1680,24 +1932,61 @@ def run_localization(
                             observable_reserve.global_ids[reserve_indices], return_index=True
                         )
                         reserve_indices = reserve_indices[np.sort(unique_positions)]
-                    augmented_points = np.concatenate([base_points, observable_reserve.points[reserve_indices]], axis=0)
                     base_covariances = final_attempt_context.get("target_covariances")
-                    augmented_covariances = (
-                        np.concatenate([base_covariances, observable_reserve.covariances[reserve_indices]], axis=0)
-                        if base_covariances is not None else None
+                    base_normals = final_attempt_context.get("target_normals")
+                    base_global_ids = np.asarray(final_attempt_context["target_global_ids"], dtype=np.int64)
+                    verifier = None
+                    verifier_start = time.perf_counter()
+                    if verifier_enabled and not bypass_candidate_gate and validation_points.shape[0]:
+                        verifier = FrozenCandidateVerifier(
+                            validation_points, base_points, base_normals,
+                            max_distance=float(registration_cfg.get("max_correspondence_distance", 0.05)),
+                            loss_scale=float(registration_cfg.get("loss_scale", 0.02)),
+                            robust_loss=str(registration_cfg.get("robust_loss", "huber")),
+                            min_correspondences=int(registration_cfg.get("min_correspondences", 6)),
+                            spatial_groups=validation_groups,
+                        )
+                    verifier_setup_ms = (time.perf_counter() - verifier_start) * 1000.0
+                    reserve_points = observable_reserve.points[reserve_indices]
+                    reserve_covariances = observable_reserve.covariances[reserve_indices]
+                    reserve_normals = observable_reserve.normals[reserve_indices]
+                    augmented_points, augmented_covariances, frozen_normals, removed_base_count = _candidate_target_arrays(
+                        mode=observable_reserve.candidate_target_mode,
+                        base_points=base_points,
+                        base_covariances=base_covariances,
+                        base_normals=base_normals,
+                        base_global_ids=base_global_ids,
+                        reserve_points=reserve_points,
+                        reserve_covariances=reserve_covariances,
+                        reserve_normals=reserve_normals,
+                        replacement_seed=observable_reserve.replacement_seed,
                     )
                     augmented_tree = build_target_index(augmented_points)["target_tree"]
-                    augmented_normals = estimate_normals(
-                        augmented_points,
-                        k=int(registration_cfg.get("normal_k", registration_cfg.get("normal_max_nn", 30))),
-                        target_tree=augmented_tree,
-                    )
+                    if observable_reserve.candidate_normal_mode == "frozen_concat":
+                        if frozen_normals is None:
+                            raise ValueError("frozen_concat candidate normals require primary target normals")
+                        augmented_normals = frozen_normals
+                        normal_source_label = "primary_plus_sidecar_frozen"
+                    else:
+                        augmented_normals = estimate_normals(
+                            augmented_points,
+                            k=int(registration_cfg.get("normal_k", registration_cfg.get("normal_max_nn", 30))),
+                            target_tree=augmented_tree,
+                        )
+                        normal_source_label = "augmented_local_pca"
                     reserve_metrics["reserve_rerun_init_source"] = "primary_result"
-                    reserve_metrics["reserve_rerun_normal_source"] = "augmented_local_pca"
+                    reserve_metrics["reserve_rerun_normal_source"] = normal_source_label
+                    reserve_metrics["reserve_candidate_target_mode"] = observable_reserve.candidate_target_mode
+                    reserve_metrics["reserve_candidate_base_removed"] = removed_base_count
+                    reserve_metrics["reserve_candidate_target_count"] = int(augmented_points.shape[0])
+                    candidate_target_count = int(augmented_points.shape[0])
+                    candidate_reserve_count = (
+                        candidate_target_count - int(base_points.shape[0]) + removed_base_count
+                    )
                     candidate_result = register_pointcloud(
                         source_points=pointcloud["points"],
                         target_points=augmented_points,
-                        init_transform=np.asarray(primary_result["transform"], dtype=np.float64),
+                        init_transform=np.array(primary_result["transform"], dtype=np.float64, copy=True),
                         backend=backend,
                         voxel_size=registration_cfg.get("voxel_size"),
                         max_correspondence_distance=float(registration_cfg.get("max_correspondence_distance", 0.05)),
@@ -1721,7 +2010,9 @@ def run_localization(
                         min_iterations=int(registration_cfg.get("min_iterations", 2)),
                         rank_tolerance=float(registration_cfg.get("rank_tolerance", 1e-9)),
                     )
-                    total_registration_latency_ms += float(candidate_result.get("latency_ms", 0.0))
+                    candidate_latency_ms = float(candidate_result.get("latency_ms", 0.0))
+                    if not probe_enabled:
+                        total_registration_latency_ms += candidate_latency_ms
                     reserve_metrics["reserve_latency_ms"] += float((time.perf_counter() - reserve_start) * 1000.0)
                     tracking_accepted, candidate_reason = _tracking_acceptance(
                         candidate_result, tracking_acceptance_cfg, backend
@@ -1729,7 +2020,23 @@ def run_localization(
                     candidate_consistency_metrics = {}
                     candidate_consistency_reason = None
                     consistency_accepted = tracking_accepted
-                    if tracking_accepted and pose_consistency_enabled:
+                    primary_pose = np.asarray(primary_result["transform"], dtype=np.float64)
+                    candidate_pose = np.asarray(candidate_result.get("transform"), dtype=np.float64)
+                    candidate_pose_valid = _is_finite_pose(candidate_pose, max_pose_translation_norm)
+                    if probe_enabled or bypass_candidate_gate:
+                        candidate_pose_valid = candidate_pose_valid and bool(
+                            np.allclose(candidate_pose[3], (0.0, 0.0, 0.0, 1.0), rtol=0.0, atol=1e-7)
+                        )
+                        if candidate_pose_valid:
+                            try:
+                                se3_log(candidate_pose)
+                            except ValueError:
+                                candidate_pose_valid = False
+                    candidate_basic_valid = tracking_accepted and candidate_pose_valid
+                    if (
+                        tracking_accepted and pose_consistency_enabled and not bypass_candidate_gate
+                        and (not probe_enabled or candidate_basic_valid)
+                    ):
                         consistency_accepted, candidate_consistency_reason, candidate_consistency_metrics = _pose_consistency_acceptance(
                             np.asarray(primary_result["transform"], dtype=np.float64),
                             candidate_result["transform"], last_valid_estimate, init_source,
@@ -1761,20 +2068,33 @@ def run_localization(
                         "reserve_tracking_accepted": tracking_accepted,
                         "reserve_consistency_accepted": consistency_accepted,
                     })
-                    primary_pose = np.asarray(primary_result["transform"], dtype=np.float64)
-                    candidate_pose = np.asarray(candidate_result["transform"], dtype=np.float64)
-                    refinement = relative_se3_log(primary_pose, candidate_pose)
-                    candidate_init = relative_se3_log(np.asarray(init_transform, dtype=np.float64), candidate_pose)
-                    for name, value in zip(("rx", "ry", "rz", "tx", "ty", "tz"), refinement["twist"]):
-                        reserve_metrics[f"reserve_refinement_twist_{name}"] = float(value)
+                    try:
+                        refinement = relative_se3_log(primary_pose, candidate_pose)
+                        candidate_init = relative_se3_log(np.asarray(init_transform, dtype=np.float64), candidate_pose)
+                    except ValueError as exc:
+                        refinement = candidate_init = None
+                        tracking_accepted = False
+                        consistency_accepted = False
+                        candidate_reason = "tracking_invalid_rotation"
+                        reserve_metrics["reserve_candidate_pose_diagnostic_error"] = str(exc)
+                        reserve_metrics["reserve_tracking_accepted"] = False
+                        reserve_metrics["reserve_consistency_accepted"] = False
+                    if (probe_enabled or bypass_candidate_gate) and not candidate_pose_valid:
+                        tracking_accepted = consistency_accepted = False
+                        candidate_reason = "tracking_quality_invalid_pose"
+                        reserve_metrics["reserve_tracking_accepted"] = False
+                        reserve_metrics["reserve_consistency_accepted"] = False
+                    if refinement is not None:
+                        for name, value in zip(("rx", "ry", "rz", "tx", "ty", "tz"), refinement["twist"]):
+                            reserve_metrics[f"reserve_refinement_twist_{name}"] = float(value)
                     reserve_metrics.update({
                         "frame_id": frame_id,
-                        "reserve_refinement_twist_norm": refinement["norm"],
-                        "reserve_refinement_rotation_deg": refinement["rotation_norm_deg"],
-                        "reserve_refinement_translation_m": refinement["translation_norm_m"],
-                        "reserve_candidate_init_twist_norm": candidate_init["norm"],
-                        "reserve_candidate_init_rotation_deg": candidate_init["rotation_norm_deg"],
-                        "reserve_candidate_init_translation_m": candidate_init["translation_norm_m"],
+                        "reserve_refinement_twist_norm": None if refinement is None else refinement["norm"],
+                        "reserve_refinement_rotation_deg": None if refinement is None else refinement["rotation_norm_deg"],
+                        "reserve_refinement_translation_m": None if refinement is None else refinement["translation_norm_m"],
+                        "reserve_candidate_init_twist_norm": None if candidate_init is None else candidate_init["norm"],
+                        "reserve_candidate_init_rotation_deg": None if candidate_init is None else candidate_init["rotation_norm_deg"],
+                        "reserve_candidate_init_translation_m": None if candidate_init is None else candidate_init["translation_norm_m"],
                         "reserve_candidate_temporal_rotation_deg": candidate_consistency_metrics.get(
                             "temporal_rotation_deg"
                         ),
@@ -1789,7 +2109,8 @@ def run_localization(
                             candidate_result.get("final_mean_robust_cost"), primary_result.get("final_mean_robust_cost")
                         ),
                     })
-                    if observable_reserve.stability_active:
+                    evaluate_candidate_gate = not bypass_candidate_gate and (not probe_enabled or refinement is not None)
+                    if evaluate_candidate_gate and observable_reserve.stability_active:
                         stability_start = time.perf_counter()
                         common_kwargs = dict(
                             source_points=np.asarray(pointcloud["points"], dtype=np.float64),
@@ -1818,14 +2139,39 @@ def run_localization(
                                 candidate_common["corr_count"], primary_common["corr_count"]
                             ),
                         })
-                    improves, improvement_reason, improvement_diagnostics = observable_reserve.evaluate_improvement(
-                        primary_result, candidate_result, reserve_metrics
-                    )
-                    reserve_metrics.update(improvement_diagnostics)
-                    reserve_metrics["reserve_relative_improvement_accepted"] = improves
+                    improves, improvement_reason = False, candidate_reason
+                    if evaluate_candidate_gate:
+                        improves, improvement_reason, improvement_diagnostics = observable_reserve.evaluate_improvement(
+                            primary_result, candidate_result, reserve_metrics, observation=reserve_observation
+                        )
+                        reserve_metrics.update(improvement_diagnostics)
+                        reserve_metrics["reserve_relative_improvement_accepted"] = improves
                     base_reserve_accepted = tracking_accepted and consistency_accepted and improves
+                    if verifier_enabled and evaluate_candidate_gate:
+                        verifier_start = time.perf_counter()
+                        verification = (
+                            verifier.evaluate_pair(primary_pose, candidate_pose, verifier_options)
+                            if verifier is not None else {
+                                "accepted": False, "reason": "empty_holdout", "metrics": {
+                                    "reserve_verifier_accepted": False,
+                                    "reserve_verifier_reason": "empty_holdout",
+                                    "reserve_verifier_source_count": 0,
+                                },
+                            }
+                        )
+                        reserve_metrics.update(verification["metrics"])
+                        verifier_evaluate_ms = (time.perf_counter() - verifier_start) * 1000.0
+                        reserve_metrics["reserve_verifier_latency_ms"] = verifier_setup_ms + verifier_evaluate_ms
+                        reserve_metrics["reserve_latency_ms"] += verifier_evaluate_ms
+                        base_reserve_accepted = base_reserve_accepted and verification["accepted"]
+                        if not verification["accepted"]:
+                            improvement_reason = "verifier_" + verification["reason"]
+                    if not _is_finite_pose(candidate_pose, max_pose_translation_norm):
+                        base_reserve_accepted = False
+                        candidate_reason = "tracking_quality_non_finite_pose"
+                        tracking_accepted = False
                     stability_accepted = True
-                    if observable_reserve.stability_active:
+                    if evaluate_candidate_gate and observable_reserve.stability_active:
                         stability_accepted, stability_reason, stability_diagnostics = observable_reserve.prospective_stability(
                             reserve_metrics, candidate_pose, primary_pose
                         )
@@ -1843,37 +2189,44 @@ def run_localization(
                         reserve_metrics["reserve_latency_ms"] += float(
                             reserve_metrics["reserve_stability_latency_ms"]
                         )
-                    reserve_metrics["reserve_accepted"] = base_reserve_accepted and (
-                        stability_accepted if observable_reserve.stability_mode == "enforce" else True
+                    reserve_metrics["reserve_accepted"] = natural_triggered and (
+                        candidate_basic_valid if bypass_candidate_gate else base_reserve_accepted and (
+                            stability_accepted if observable_reserve.stability_mode == "enforce" else True
+                        )
                     )
                     if reserve_metrics["reserve_accepted"]:
-                        result = candidate_result
-                        accepted = True
-                        acceptance_reason = None
-                        final_consistency_reason = candidate_consistency_reason
-                        final_consistency_metrics = candidate_consistency_metrics
-                        reserve_metrics["reserve_used"] = True
-                        reserve_metrics["reserve_adoption_reason"] = (
-                            improvement_reason
-                            if observable_reserve.accept_only_if.get("protocol") in (
+                        if bypass_candidate_gate:
+                            reserve_metrics["reserve_adoption_reason"] = "candidate_gate_bypassed"
+                        elif observable_reserve.accept_only_if.get("protocol") in (
                                 "branch_aware_information_v3", "branch_aware_information_v4",
+                        ):
+                            reserve_metrics["reserve_adoption_reason"] = improvement_reason
+                        else:
+                            reserve_metrics["reserve_adoption_reason"] = (
+                                "rescued_primary_rejection" if not primary_accepted else "improved_primary"
                             )
-                            else ("rescued_primary_rejection" if not primary_accepted else "improved_primary")
-                        )
-                    elif not primary_accepted:
+                        if not probe_enabled:
+                            result = candidate_result
+                            accepted = True
+                            acceptance_reason = None
+                            final_consistency_reason = candidate_consistency_reason
+                            final_consistency_metrics = candidate_consistency_metrics
+                            reserve_metrics["reserve_used"] = True
+                    elif not primary_accepted and not probe_enabled:
                         acceptance_reason = primary_rejection_reason or candidate_reason
-                    if not reserve_metrics["reserve_used"]:
+                    if not reserve_metrics["reserve_accepted"]:
                         if base_reserve_accepted and observable_reserve.stability_mode == "enforce" and not stability_accepted:
                             reserve_metrics["reserve_adoption_reason"] = reserve_metrics["reserve_stability_reasons"]
                         else:
                             reserve_metrics["reserve_adoption_reason"] = (
                                 candidate_reason if not tracking_accepted or not consistency_accepted else improvement_reason
                             )
-                    observable_reserve.add_stability_attempt(
-                        frame_id, primary_pose, candidate_pose, init_transform,
-                        reserve_metrics, bool(reserve_metrics["reserve_used"]),
-                    )
-                if observable_reserve.mode == "active":
+                    if not probe_enabled and not bypass_candidate_gate:
+                        observable_reserve.add_stability_attempt(
+                            frame_id, primary_pose, candidate_pose, init_transform,
+                            reserve_metrics, bool(reserve_metrics["reserve_used"]),
+                        )
+                if observable_reserve.mode == "active" and not probe_enabled and not bypass_candidate_gate:
                     observable_reserve.commit_branch_adoption(
                         frame_id,
                         bool(reserve_metrics["reserve_used"]),
@@ -1889,6 +2242,8 @@ def run_localization(
                     )
                 observable_reserve.add_record(reserve_metrics)
                 selection_event_writer.write(frame_id, reserve_plan, reserve_metrics)
+            if probe_enabled:
+                probe_latency_ms = (time.perf_counter() - probe_start) * 1000.0
             if evaluation_protocol == "mvp_strict" and not accepted and recovery_enabled:
                 assert last_valid_estimate is not None
                 for tier in range(1, recovery_max_tier + 1):
@@ -2051,6 +2406,10 @@ def run_localization(
             final_target_oracle_status = str(final_target_oracle.records[-1]["status"])
             final_target_oracle_latency_ms = float(final_target_oracle.records[-1]["diagnostic_latency_ms"])
         total_frame_latency_ms = float((time.perf_counter() - frame_start) * 1000.0)
+        if stages is not None:
+            stage_profile(dict(stages, frame_id=frame_id, total_frame_ms=total_frame_latency_ms,
+                               tracking_valid=tracking_valid, recovered=recovered,
+                               recovery_attempted=recovery_attempted))
         diagnostic_latency_ms = (
             float(activation_diagnostics.records[-1]["diagnostic_latency_ms"])
             if activation_diagnostics.enabled and activation_diagnostics.records else 0.0
@@ -2067,8 +2426,63 @@ def run_localization(
         production_equivalent_total_frame_latency_ms = max(
             0.0,
             total_frame_latency_ms - diagnostic_latency_ms - plan_only_latency_ms - oracle_diagnostic_latency_ms
-            - paired_shadow_latency_ms - final_target_oracle_latency_ms,
+            - paired_shadow_latency_ms - final_target_oracle_latency_ms
+            - (probe_latency_ms if observable_reserve.mode != "plan_only" else 0.0),
         )
+        if candidate_probe is not None:
+            natural_triggered = bool(reserve_metrics["reserve_triggered"])
+            gated_adopted = bool(reserve_metrics["reserve_accepted"])
+            ungated_adopted = natural_triggered and candidate_basic_valid
+            baseline_source = (
+                "seed" if output_idx == 0 else "hold_last_valid" if not tracking_valid
+                else "recovery" if recovered else "primary"
+            )
+            probe_row = {
+                "frame_id": frame_id,
+                "timestamp": timestamp,
+                "source_idx": source_idx,
+                "init_pose": (estimated_c2w if output_idx == 0 else init_transform).copy(),
+                "gt_pose": gt_c2w.copy(),
+                "natural_triggered": natural_triggered,
+                "force_eligible": force_eligible,
+                "force_requested": force_requested,
+                "forced_attempt": forced_attempt,
+                "candidate_attempted": bool(reserve_metrics["reserve_attempted"]),
+                "candidate_submitted": bool(reserve_metrics["reserve_used"]),
+                "candidate_basic_valid": candidate_basic_valid,
+                "candidate_latency_ms": candidate_latency_ms,
+                "probe_latency_ms": probe_latency_ms,
+                "candidate_reserve_count": candidate_reserve_count,
+                "candidate_target_count": candidate_target_count,
+                "primary_target_count": primary_result["num_target_points"],
+                "gated_adopted": gated_adopted,
+                "ungated_adopted": ungated_adopted,
+                "baseline_recovery_attempted": recovery_attempted,
+                "baseline_recovery_stage": recovery_stage,
+                "reserve_metrics": dict(reserve_metrics),
+            }
+            for label, pose, valid, source in (
+                ("primary", primary_result["transform"], primary_accepted, "seed" if output_idx == 0 else "primary"),
+                ("candidate", candidate_pose, candidate_basic_valid, "reserve" if candidate_pose is not None else None),
+                ("baseline", estimated_c2w, tracking_valid, baseline_source),
+                ("gated", candidate_pose if gated_adopted else estimated_c2w, gated_adopted or tracking_valid,
+                 "reserve" if gated_adopted else baseline_source),
+                ("ungated", candidate_pose if ungated_adopted else estimated_c2w, ungated_adopted or tracking_valid,
+                 "reserve" if ungated_adopted else baseline_source),
+            ):
+                finite = _is_finite_pose(pose, float("inf"))
+                probe_row[f"{label}_pose"] = np.array(pose, dtype=np.float64, copy=True) if finite else None
+                probe_row[f"{label}_tracking_valid"] = bool(valid and finite)
+                probe_row[f"{label}_source"] = source
+                # Ground truth is used only for reporting, never for either adoption decision.
+                error_valid = valid and finite and _is_finite_pose(gt_c2w, float("inf"))
+                probe_row[f"{label}_raw_translation_error_m"] = (
+                    float(np.linalg.norm(pose[:3, 3] - gt_c2w[:3, 3])) if error_valid else None
+                )
+                probe_row[f"{label}_raw_rotation_error_deg"] = (
+                    _rotation_angle_deg(gt_c2w[:3, :3].T @ pose[:3, :3]) if error_valid else None
+                )
+            candidate_probe(probe_row)
         if memory_enabled and (output_idx % memory_check_interval == 0 or rss_mb is None):
             rss_mb, peak_rss_mb = get_process_memory_mb()
             if max_rss_mb is not None and rss_mb > float(max_rss_mb):
@@ -2230,6 +2644,9 @@ def run_localization(
                     "temporal_translation_limit_m", "temporal_rotation_limit_deg",
                 ):
                     row[f"{prefix}_{name}"] = _csv_value(values.get(name))
+        if evaluation_protocol == "mvp_strict":
+            row["source_training_count"] = int(pointcloud["points"].shape[0])
+            row["source_validation_count"] = int(validation_points.shape[0])
         frame_rows.append(row)
 
     est_poses = np.stack(est_poses, axis=0)
@@ -2423,7 +2840,12 @@ def run_localization(
             }
         )
         summary.update(observable_reserve.summary())
-        observable_reserve.save_stability_attempts(output_root)
+        if probe_enabled:
+            summary["candidate_probe"] = True
+        if bypass_candidate_gate:
+            summary["bypass_candidate_gate"] = True
+        if not probe_enabled and not bypass_candidate_gate:
+            observable_reserve.save_stability_attempts(output_root)
         if paired_shadow is not None:
             paired_summary = paired_shadow.save(
                 paired_evaluations, output_root / "paired_reserve", parent_trajectory_sha256=trajectory_hash

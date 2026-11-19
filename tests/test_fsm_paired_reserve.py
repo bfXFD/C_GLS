@@ -6,11 +6,15 @@ import numpy as np
 import pytest
 
 from utils.fsm_local_map import LocalSubmapConfig
+from utils.fsm_correspondence_weak import _camera_geometry, normalized_hessian_diagnostics
 from utils.fsm_paired_reserve import (
     BaselineSnapshot,
     PairedShadowReserve,
+    _actual_reserve_hessian,
+    _normalized_diagnostic_hessian,
     runtime_corr_weak_scores,
 )
+from utils.fsm_robust_registration import evaluate_point_to_plane_diagnostics, se3_exp
 from utils.fsm_runtime_reserve import rank_diverse_reserve
 
 
@@ -406,3 +410,114 @@ def test_augmented_duplicate_global_ids_fail_arm_strictly():
     result = reserve.evaluate(make_snapshot(target_ids=(10, 11)))
     assert result.rows[0]["status"] == "ok"
     assert set(result.selected_global_ids[0]).isdisjoint({10, 11})
+
+
+@pytest.mark.parametrize("length", [0.2, 2.3, 8.0])
+def test_normalized_diagnostic_hessians_match_transformed_world_left_rows(length):
+    rng = np.random.default_rng(41)
+    pose = se3_exp(np.array([0.3, -0.5, 0.2, 1.2, -0.7, 2.0]))
+    jacobians = rng.normal(size=(12, 6))
+    weights = np.linspace(0.2, 1.4, len(jacobians))
+    target_ids = np.array([10, 11, 100, 100, 101, 102, 10, 101, 11, 102, 10, 11])
+    selected = np.array([100, 101, 999])
+    result = {"jacobians": jacobians, "weights": weights, "target_ids": target_ids}
+    adjoint = _camera_geometry(pose)[2]
+    coordinate_map = np.diag([1.0 / length] * 3 + [1.0] * 3)
+    transformed_rows = jacobians @ adjoint @ coordinate_map
+    expected = (transformed_rows.T * weights) @ transformed_rows
+    actual = _normalized_diagnostic_hessian(result, length, pose)
+    np.testing.assert_allclose(actual, expected, atol=1e-12)
+    hessian_world = (jacobians.T * weights) @ jacobians
+    np.testing.assert_allclose(actual, normalized_hessian_diagnostics(
+        hessian_world, pose, characteristic_length=length,
+    )["hessian"], atol=1e-12)
+    scale_only = jacobians @ coordinate_map
+    assert not np.allclose(actual, (scale_only.T * weights) @ scale_only)
+
+    mask = np.isin(target_ids, selected)
+    reserve_h, flags, count, unique = _actual_reserve_hessian(result, selected, length, pose)
+    expected_reserve = (transformed_rows[mask].T * weights[mask]) @ transformed_rows[mask]
+    np.testing.assert_allclose(reserve_h, expected_reserve, atol=1e-12)
+    np.testing.assert_array_equal(flags, [True, True, False])
+    assert (count, unique) == (4, 2)
+    raw_h, raw_flags, raw_count, raw_unique = _actual_reserve_hessian(result, selected, None, pose)
+    np.testing.assert_allclose(raw_h, (jacobians[mask].T * weights[mask]) @ jacobians[mask], atol=1e-12)
+    np.testing.assert_array_equal(raw_flags, flags)
+    assert (raw_count, raw_unique) == (count, unique)
+    empty_h, empty_flags, count, unique = _actual_reserve_hessian(result, np.array([999]), length, pose)
+    np.testing.assert_array_equal(empty_h, np.zeros((6, 6)))
+    np.testing.assert_array_equal(empty_flags, [False])
+    assert (count, unique) == (0, 0)
+
+
+def test_paired_normalized_metrics_are_invariant_to_common_world_reexpression():
+    rng = np.random.default_rng(93)
+    source = rng.uniform([-1.5, -1.0, 1.0], [1.5, 1.0, 4.0], size=(18, 3))
+    normals_camera = rng.normal(size=source.shape)
+    normals_camera /= np.linalg.norm(normals_camera, axis=1, keepdims=True)
+    pose = se3_exp(np.array([0.2, -0.4, 0.3, 0.8, -1.2, 0.5]))
+    world_change = se3_exp(np.array([-0.5, 0.1, -0.2, 2.0, -3.0, 1.0]))
+    evaluations = []
+    for reference_pose in (pose, world_change @ pose):
+        points_world = source @ reference_pose[:3, :3].T + reference_pose[:3, 3]
+        normals_world = normals_camera @ reference_pose[:3, :3].T
+        primary_ids = np.arange(9)
+        reserve_ids = np.arange(100, 109)
+        primary = evaluate_point_to_plane_diagnostics(
+            source, points_world[:9], normals_world[:9], reference_pose,
+            min_correspondences=1, target_ids=primary_ids, return_correspondences=True,
+        )
+        # Raw diagnostics are world-left, not camera-frame rows.
+        expected_rows = np.column_stack((
+            np.cross(points_world[primary["source_indices"]], normals_world[primary["target_indices"]]),
+            normals_world[primary["target_indices"]],
+        ))
+        np.testing.assert_allclose(primary["jacobians"], expected_rows, atol=1e-13)
+        snapshot = dataclasses.replace(
+            make_snapshot(), source_points=source, primary_pose=reference_pose,
+            primary_hessian=primary["hessian"], target_points=points_world[:9],
+            target_normals=normals_world[:9], target_global_ids=primary_ids,
+            source_pixel_ids=np.arange(len(source)),
+        )
+        reserve = PairedShadowReserve(
+            {"policies": ["saliency"], "budgets": [9], "trigger": {"always": True},
+             "registration": {"min_correspondences": 1},
+             "diversity": {"voxel_cap": None},
+             "adaptive_weak": {"characteristic_length_min": 8.0, "characteristic_length_max": 8.0}},
+            points_world[9:], normals_world[9:], np.arange(9, dtype=np.float64),
+            reserve_ids, FakeIndex(9), LocalSubmapConfig(near=0.1, far=5.0),
+            registration_fn=RegistrationRecorder(),
+        )
+        evaluation = reserve.evaluate(snapshot)
+        row = evaluation.rows[0]
+        assert row["status"] == "ok", row["error_message"]
+        assert row["characteristic_length"] == 8.0
+        assert row["actual_correspondence_count"] == 9
+        for raw_name, normalized_name in (
+            ("primary_hessian", "primary_hessian_normalized"),
+            ("augmented_hessian", "augmented_hessian_normalized"),
+            ("actual_reserve_hessian", "actual_reserve_hessian_normalized"),
+        ):
+            expected = normalized_hessian_diagnostics(
+                getattr(evaluation, raw_name)[0], reference_pose, characteristic_length=8.0,
+            )["hessian"]
+            np.testing.assert_allclose(getattr(evaluation, normalized_name)[0], expected, atol=1e-12)
+        np.testing.assert_allclose(
+            evaluation.augmented_hessian_normalized[0] - evaluation.primary_hessian_normalized[0],
+            evaluation.actual_reserve_hessian_normalized[0], atol=1e-12,
+        )
+        assert row["net_weak_gain"] == pytest.approx(row["actual_reserve_weak_gain"], abs=1e-12)
+        evaluations.append(evaluation)
+
+    first, second = evaluations
+    for name in ("primary_hessian_normalized", "augmented_hessian_normalized",
+                 "actual_reserve_hessian_normalized"):
+        np.testing.assert_allclose(getattr(first, name), getattr(second, name), atol=1e-12)
+    inverse_adjoint = np.linalg.inv(_camera_geometry(world_change)[2])
+    for name in ("primary_hessian", "augmented_hessian", "actual_reserve_hessian"):
+        expected = inverse_adjoint.T @ getattr(first, name)[0] @ inverse_adjoint
+        np.testing.assert_allclose(getattr(second, name)[0], expected, atol=1e-11)
+    for metric in ("characteristic_length", "weak_subspace_dim", "primary_logdet_gain",
+                   "augmented_logdet_gain", "net_logdet_gain", "baseline_weak_information",
+                   "actual_reserve_weak_gain", "net_weak_gain", "predicted_weak_gain"):
+        assert first.rows[0][metric] == pytest.approx(second.rows[0][metric], abs=1e-10)

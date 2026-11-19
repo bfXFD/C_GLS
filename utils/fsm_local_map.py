@@ -26,6 +26,7 @@ class LocalSubmapConfig:
     oracle_mode: str = "off"
     oracle_overflow_policy: str = "uncapped_chunked"
     oracle_point_chunk: int = 262144
+    coverage_representatives: str = "ranked"
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.near) or self.near < 0.0:
@@ -42,6 +43,10 @@ class LocalSubmapConfig:
             raise ValueError("max_points must be a positive integer or None")
         if self.sampling_policy not in ("coverage", "legacy"):
             raise ValueError("sampling_policy must be 'coverage' or 'legacy'")
+        if self.coverage_representatives not in ("ranked", "spatial_strata"):
+            raise ValueError("unknown coverage_representatives policy")
+        if self.coverage_representatives != "ranked" and self.sampling_policy != "coverage":
+            raise ValueError("spatial_strata requires coverage sampling")
         if self.frustum_culling not in ("radius", "voxel_blocks"):
             raise ValueError("frustum_culling must be 'radius' or 'voxel_blocks'")
         if not np.isfinite(self.block_size_m) or self.block_size_m <= 0.0:
@@ -56,6 +61,8 @@ class LocalSubmapConfig:
             raise ValueError("projection_sampling_policy must be 'block_coverage'")
         if self.oracle_mode not in ("off", "measure", "enforce"):
             raise ValueError("oracle_mode must be 'off', 'measure', or 'enforce'")
+        if self.coverage_representatives != "ranked" and self.oracle_mode != "off":
+            raise ValueError("spatial_strata requires oracle_mode='off'")
         if self.oracle_overflow_policy not in ("uncapped_chunked", "fail_closed"):
             raise ValueError("oracle_overflow_policy must be 'uncapped_chunked' or 'fail_closed'")
         for value, name in (
@@ -775,6 +782,28 @@ class MapSpatialIndex:
             if take == 0:
                 continue
             members = bucket_order[begin:end]
+            if config.coverage_representatives == "spatial_strata":
+                coordinates = np.column_stack((projected_u[members], projected_v[members], depth[members]))
+                low = coordinates.min(axis=0)
+                span = np.ptp(coordinates, axis=0)
+                normalized = (coordinates - low) / np.where(span > 0, span, 1)
+                cells = np.minimum((4 * normalized).astype(int), 3)
+                cell_id = cells @ np.array([16, 4, 1])
+                center_distance = np.sum((4 * normalized - cells - 0.5) ** 2, axis=1)
+                order = np.lexsort((indices[members], center_distance, cell_id))
+                sorted_cells = cell_id[order]
+                starts_in_cell = np.maximum.accumulate(np.where(
+                    np.r_[True, sorted_cells[1:] != sorted_cells[:-1]], np.arange(len(order)), 0))
+                ranks = np.arange(len(order)) - starts_in_cell
+                rank_order = np.argsort(ranks, kind="stable")
+                order = order[rank_order]
+                ordered_ranks = ranks[rank_order]
+                edge = np.searchsorted(ordered_ranks, ordered_ranks[take - 1])
+                end_rank = np.searchsorted(ordered_ranks, ordered_ranks[take - 1], side="right")
+                # Spread the partial round across occupied cells, not just the first cells.
+                positions = (np.arange(take - edge) + 0.5) * (end_rank - edge) / (take - edge)
+                selected_parts.append(members[np.r_[order[:edge], order[edge + positions.astype(int)]]])
+                continue
             if scores is not None:
                 order = np.lexsort((indices[members], depth[members], -scores[indices[members]]))
             else:
@@ -807,6 +836,8 @@ class MapSpatialIndex:
             raise TypeError("config must be a LocalSubmapConfig")
         if config.max_points is None or config.sampling_policy != "coverage":
             raise ValueError("stream_exact_final_target requires coverage sampling with max_points")
+        if config.coverage_representatives != "ranked":
+            raise ValueError("stream_exact_final_target only supports ranked representatives")
         if config.near <= 0.0:
             raise ValueError("stream_exact_final_target requires near > 0 for bounded two-pass depth binning")
         if block_score_token is not None and scores is not None:

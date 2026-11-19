@@ -12,10 +12,11 @@ import numpy as np
 from utils.fsm_correspondence_weak import (
     correspondence_aware_weak_scores,
     correspondence_probability,
+    normalized_hessian_diagnostics,
     organized_depth_source_normals,
 )
 from utils.fsm_local_map import LocalSubmapConfig, MapSpatialIndex
-from utils.fsm_map import load_activation_geometry
+from utils.fsm_map import load_runtime_reserve_geometry
 from utils.fsm_robust_registration import evaluate_point_to_plane_diagnostics
 
 
@@ -34,16 +35,42 @@ def _skew(vector: np.ndarray) -> np.ndarray:
     return np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=np.float64)
 
 
+def _project_near_rotation(rotation: np.ndarray, max_defect: float = 1e-3) -> np.ndarray:
+    rotation = np.asarray(rotation, dtype=np.float64)
+    if rotation.shape != (3, 3) or np.any(~np.isfinite(rotation)):
+        raise ValueError("rotation must be a finite 3x3 matrix")
+    orthogonality_defect = float(np.linalg.norm(rotation.T @ rotation - np.eye(3), ord="fro"))
+    determinant = float(np.linalg.det(rotation))
+    if determinant <= 0.0 or max(orthogonality_defect, abs(determinant - 1.0)) > float(max_defect):
+        raise ValueError("transform rotation is too far from SO(3)")
+    if orthogonality_defect <= 1e-7 and abs(determinant - 1.0) <= 1e-7:
+        return rotation
+    left, _, right = np.linalg.svd(rotation)
+    projected = left @ right
+    if np.linalg.det(projected) < 0.0:
+        left[:, -1] *= -1.0
+        projected = left @ right
+    return projected
+
+
+def _pose_for_relative_log(pose: np.ndarray) -> np.ndarray:
+    value = np.asarray(pose, dtype=np.float64)
+    if value.shape != (4, 4) or np.any(~np.isfinite(value)):
+        raise ValueError("pose must be a finite 4x4 matrix")
+    normalized = value.copy()
+    normalized[:3, :3] = _project_near_rotation(value[:3, :3])
+    normalized[3] = np.array([0.0, 0.0, 0.0, 1.0])
+    return normalized
+
+
 def se3_log(transform: np.ndarray) -> np.ndarray:
     """Return a signed SE(3) logarithm in [rotation, translation] order."""
     value = np.asarray(transform, dtype=np.float64)
     if value.shape != (4, 4) or np.any(~np.isfinite(value)):
         raise ValueError("transform must be a finite 4x4 matrix")
-    rotation = value[:3, :3]
-    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-7) or not np.isclose(
-        np.linalg.det(rotation), 1.0, atol=1e-7
-    ):
-        raise ValueError("transform rotation must be a valid rotation matrix")
+    rotation = _project_near_rotation(value[:3, :3])
+    value = value.copy()
+    value[:3, :3] = rotation
     cosine = float(np.clip((np.trace(rotation) - 1.0) * 0.5, -1.0, 1.0))
     angle = float(np.arccos(cosine))
     antisymmetric = np.array([
@@ -80,10 +107,8 @@ def se3_log(transform: np.ndarray) -> np.ndarray:
 
 def relative_se3_log(reference_pose: np.ndarray, candidate_pose: np.ndarray) -> dict[str, Any]:
     """Describe a candidate pose relative to a reference without ground truth."""
-    reference = np.asarray(reference_pose, dtype=np.float64)
-    candidate = np.asarray(candidate_pose, dtype=np.float64)
-    if reference.shape != (4, 4) or candidate.shape != (4, 4):
-        raise ValueError("reference_pose and candidate_pose must be 4x4 matrices")
+    reference = _pose_for_relative_log(reference_pose)
+    candidate = _pose_for_relative_log(candidate_pose)
     twist = se3_log(np.linalg.inv(reference) @ candidate)
     rotation_norm = float(np.linalg.norm(twist[:3]))
     translation_norm = float(np.linalg.norm(twist[3:]))
@@ -423,6 +448,14 @@ class RuntimeObservableReserve:
         if self.mode not in ("off", "plan_only", "active"):
             raise ValueError("observable_reserve.mode must be off, plan_only, or active")
         self.active = self.enabled and self.mode != "off"
+        self.spectral_coordinates = str(cfg.get("spectral_coordinates", "world_raw"))
+        if self.spectral_coordinates not in ("world_raw", "primary_camera_depth"):
+            raise ValueError("observable_reserve.spectral_coordinates must be world_raw or primary_camera_depth")
+        self.attempt_without_selection = cfg.get("attempt_without_selection", False)
+        if not isinstance(self.attempt_without_selection, bool):
+            raise ValueError("observable_reserve.attempt_without_selection must be boolean")
+        if self.attempt_without_selection and cfg.get("candidate_target_mode", "append") != "rerun_primary":
+            raise ValueError("observable_reserve.attempt_without_selection requires rerun_primary")
         self.available = False
         self.unavailable_reason = "disabled"
         self.geometry_path: str | None = None
@@ -467,6 +500,11 @@ class RuntimeObservableReserve:
         if self.weak_dim < 1 or self.weak_dim > 3:
             raise ValueError("observable_reserve.weak_subspace_dim must be between 1 and 3")
         self.selection = str(cfg.get("selection", "runtime_weak"))
+        self.corr_rank_control = cfg.get("corr_rank_control", "corr_weak")
+        if self.corr_rank_control not in ("corr_weak", "weak", "random"):
+            raise ValueError("Invalid observable_reserve.corr_rank_control")
+        if self.corr_rank_control != "corr_weak" and self.selection != "runtime_corr_weak":
+            raise ValueError("corr_rank_control requires runtime_corr_weak")
         if self.selection not in ("runtime_weak", "runtime_corr_weak", "saliency", "random"):
             raise ValueError(
                 "observable_reserve.selection must be runtime_weak, runtime_corr_weak, saliency, or random"
@@ -478,6 +516,17 @@ class RuntimeObservableReserve:
         self.rerun_iterations = int(cfg.get("rerun_iterations", config.get("registration", {}).get("max_iterations", 30)))
         if self.rerun_iterations <= 0:
             raise ValueError("observable_reserve.rerun_iterations must be positive")
+        self.candidate_target_mode = str(cfg.get("candidate_target_mode", "append"))
+        if self.candidate_target_mode not in ("append", "replace", "rerun_primary"):
+            raise ValueError(
+                "observable_reserve.candidate_target_mode must be append, replace, or rerun_primary"
+            )
+        self.candidate_normal_mode = str(cfg.get("candidate_normal_mode", "augmented_local_pca"))
+        if self.candidate_normal_mode not in ("augmented_local_pca", "frozen_concat"):
+            raise ValueError(
+                "observable_reserve.candidate_normal_mode must be augmented_local_pca or frozen_concat"
+            )
+        self.replacement_seed = int(cfg.get("replacement_seed", self.seed))
         self.accept_only_if = cfg.get("accept_only_if", {}) or {}
         if not isinstance(self.accept_only_if, dict):
             raise ValueError("observable_reserve.accept_only_if must be a dictionary")
@@ -541,18 +590,10 @@ class RuntimeObservableReserve:
         if not expected_params or not expected_controls:
             self.unavailable_reason = "map_provenance_unavailable"
             return
-        raw = np.load(self.geometry_path, allow_pickle=False)
-        version = int(np.asarray(raw["schema_version"])) if "schema_version" in raw else 0
-        raw.close()
-        if version < 2:
+        geometry = load_runtime_reserve_geometry(self.geometry_path, fsm_map)
+        if geometry is None:
             self.unavailable_reason = "schema_v1_no_reserve"
             return
-        geometry = load_activation_geometry(
-            self.geometry_path,
-            fsm_map,
-            source_params_sha256=expected_params,
-            selection_controls_sha256=expected_controls,
-        )
         self.global_ids = np.asarray(geometry["reserve_global_ids"], dtype=np.int64)
         self.points = np.asarray(geometry["reserve_means"], dtype=np.float64)
         self.normals = np.asarray(geometry["reserve_normals"], dtype=np.float64)
@@ -592,6 +633,12 @@ class RuntimeObservableReserve:
             "reserve_candidate_normalized_lambda_min": None,
             "reserve_selection_score": None,
             "reserve_primary_condition": None,
+            "reserve_spectral_coordinates": "world_raw",
+            "reserve_spectral_length": None,
+            "reserve_spectral_primary_lambda": None,
+            "reserve_spectral_candidate_lambda": None,
+            "reserve_spectral_primary_condition": None,
+            "reserve_spectral_candidate_condition": None,
             "reserve_augmented_condition": None,
             "reserve_primary_lambda_min": None,
             "reserve_augmented_lambda_min": None,
@@ -693,16 +740,34 @@ class RuntimeObservableReserve:
             "reserve_backend": "disabled" if mode == "off" else reason,
         }
 
-    def _trigger(self, result: dict[str, Any]) -> tuple[bool, list[str], str | None]:
+    def _trigger(
+        self, result: dict[str, Any], observation: RuntimeReserveObservation | None = None,
+    ) -> tuple[bool, list[str], str | None]:
         pose = np.asarray(result.get("transform", []), dtype=np.float64)
         if pose.shape != (4, 4) or np.any(~np.isfinite(pose)):
             return False, [], "primary_pose_non_finite"
         hessian = np.asarray(result.get("hessian", []), dtype=np.float64)
         if hessian.shape != (6, 6) or np.any(~np.isfinite(hessian)):
             return False, [], "hessian_unavailable"
-        symmetric = 0.5 * (hessian + hessian.T)
-        eigenvalues = np.linalg.eigvalsh(symmetric)
-        trace = float(np.trace(symmetric))
+        normalized = None
+        if getattr(self, "spectral_coordinates", "world_raw") == "primary_camera_depth":
+            if observation is None:
+                return False, [], "missing_observation"
+            try:
+                normalized = normalized_hessian_diagnostics(hessian, pose, observation.source_points_camera)
+            except (ValueError, TypeError, AttributeError, np.linalg.LinAlgError):
+                return False, [], "spectral_normalization_failed"
+            result = dict(result, condition_number=normalized["condition_number"],
+                          effective_rank=normalized["effective_rank"])
+            eigenvalues = normalized["eigenvalues"]
+            trace = float(np.sum(eigenvalues))
+        else:
+            symmetric = 0.5 * (hessian + hessian.T)
+            try:
+                eigenvalues = np.linalg.eigvalsh(symmetric)
+            except np.linalg.LinAlgError:
+                return False, [], "hessian_zero_or_invalid_spectrum"
+            trace = float(np.trace(symmetric))
         if not np.all(np.isfinite(eigenvalues)) or trace <= 0.0:
             return False, [], "hessian_zero_or_invalid_spectrum"
         correspondences = result.get("num_correspondences")
@@ -713,7 +778,8 @@ class RuntimeObservableReserve:
         if limit is not None and float(result.get("condition_number", float("inf"))) > float(limit):
             reasons.append("condition_number")
         limit = self.trigger.get("normalized_lambda_min")
-        if limit is not None and (float(eigenvalues[0]) / trace if trace > 0.0 else 0.0) < float(limit):
+        normalized_lambda = normalized["normalized_lambda_min"] if normalized is not None else float(eigenvalues[0]) / trace
+        if limit is not None and normalized_lambda < float(limit):
             reasons.append("normalized_lambda_min")
         limit = self.trigger.get("iterations")
         if limit is not None and int(result.get("iterations", 0)) >= int(limit):
@@ -804,6 +870,7 @@ class RuntimeObservableReserve:
             probability, visible_indices=eligible,
             min_dim=int(self.config.get("corr_weak_min_dim", 1)),
             max_dim=int(self.config.get("corr_weak_max_dim", min(3, max(1, self.weak_dim)))),
+            alpha=0.0 if getattr(self, "corr_rank_control", "corr_weak") == "weak" else 1.0,
         )
         weak = details["weak"]
         metrics.update({
@@ -828,6 +895,7 @@ class RuntimeObservableReserve:
         observation: RuntimeReserveObservation | None = None,
     ) -> ReservePlan:
         metrics = self.empty_metrics(self.mode, self.unavailable_reason)
+        metrics["reserve_spectral_coordinates"] = getattr(self, "spectral_coordinates", "world_raw")
         metrics["reserve_stability_gate_enabled"] = bool(getattr(self, "stability_active", False))
         metrics["reserve_stability_gate_mode"] = str(getattr(self, "stability_mode", "off"))
         if getattr(self, "selection", None) == "runtime_corr_weak":
@@ -836,19 +904,41 @@ class RuntimeObservableReserve:
         if not self.active or not self.available:
             return ReservePlan(metrics, np.empty(0, dtype=np.int64))
         start = time.perf_counter()
-        triggered, reasons, unavailable_reason = self._trigger(result)
+        triggered, reasons, unavailable_reason = self._trigger(result, observation)
         metrics["reserve_triggered"] = triggered
         metrics["reserve_trigger_reasons"] = "|".join(reasons)
         metrics["reserve_trigger_unavailable_reason"] = unavailable_reason
         hessian = np.asarray(result.get("hessian", []), dtype=np.float64)
-        eigenvalues = np.linalg.eigvalsh(0.5 * (hessian + hessian.T)) if hessian.shape == (6, 6) else np.empty(0)
-        metrics["reserve_primary_condition"] = result.get("condition_number")
-        metrics["reserve_primary_lambda_min"] = float(eigenvalues[0]) if eigenvalues.size else None
-        metrics.update(hessian_block_diagnostics(hessian, result.get("transform", [])))
+        if metrics["reserve_spectral_coordinates"] == "primary_camera_depth":
+            if unavailable_reason is None:
+                spectral = normalized_hessian_diagnostics(
+                    hessian, result["transform"], observation.source_points_camera
+                )
+                metrics.update({
+                    "reserve_spectral_length": float(spectral["characteristic_length"]),
+                    "reserve_primary_condition": float(spectral["condition_number"]),
+                    "reserve_primary_lambda_min": float(spectral["eigenvalues"][0]),
+                    "reserve_spectral_primary_condition": float(spectral["condition_number"]),
+                    "reserve_spectral_primary_lambda": float(spectral["eigenvalues"][0]),
+                })
+        else:
+            metrics["reserve_primary_condition"] = result.get("condition_number")
+            if hessian.shape == (6, 6) and np.all(np.isfinite(hessian)):
+                try:
+                    eigenvalues = np.linalg.eigvalsh(0.5 * (hessian + hessian.T))
+                    metrics["reserve_primary_lambda_min"] = float(eigenvalues[0])
+                except np.linalg.LinAlgError:
+                    pass
+        if unavailable_reason is None:
+            metrics.update(hessian_block_diagnostics(hessian, result.get("transform", [])))
         metrics["reserve_backend"] = self.index.backend
         metrics["reserve_plan_pose_source"] = "primary_result"
         metrics["reserve_plan_normal_source"] = self.plan_normal_source
         if not triggered:
+            metrics["reserve_latency_ms"] = float((time.perf_counter() - start) * 1000.0)
+            return ReservePlan(metrics, np.empty(0, dtype=np.int64))
+        if (getattr(self, "candidate_target_mode", "append") == "rerun_primary"
+                and getattr(self, "attempt_without_selection", False)):
             metrics["reserve_latency_ms"] = float((time.perf_counter() - start) * 1000.0)
             return ReservePlan(metrics, np.empty(0, dtype=np.int64))
         if self.selection == "runtime_corr_weak" and not isinstance(observation, RuntimeReserveObservation):
@@ -895,6 +985,8 @@ class RuntimeObservableReserve:
                 selection_scores, eligible, corr_probability = self._corr_scores(
                     observation, visible, pose, hessian, np.asarray(intrinsics, dtype=np.float64), metrics
                 )
+                if getattr(self, "corr_rank_control", "corr_weak") == "random":
+                    selection_scores = np.random.default_rng(self.seed + int(frame_id)).random(self.points.shape[0])
             except Exception as exc:
                 metrics.update({
                     "reserve_corr_status": "unavailable",
@@ -948,6 +1040,7 @@ class RuntimeObservableReserve:
 
     def evaluate_improvement(
         self, primary: dict[str, Any], candidate: dict[str, Any], context_metrics: dict[str, Any] | None = None,
+        *, observation: RuntimeReserveObservation | None = None,
     ) -> tuple[bool, str, dict[str, Any]]:
         diagnostics = {
             "reserve_relative_improvement_protocol": self.accept_only_if.get("protocol"),
@@ -959,7 +1052,36 @@ class RuntimeObservableReserve:
             "reserve_relative_lambda_pass": None,
             "reserve_relative_lambda_ratio": None,
             "reserve_relative_improvement_reasons": "",
+            "reserve_spectral_coordinates": getattr(self, "spectral_coordinates", "world_raw"),
+            "reserve_spectral_length": None,
+            "reserve_spectral_primary_lambda": None,
+            "reserve_spectral_candidate_lambda": None,
+            "reserve_spectral_primary_condition": None,
+            "reserve_spectral_candidate_condition": None,
         }
+        if diagnostics["reserve_spectral_coordinates"] == "primary_camera_depth":
+            if observation is None:
+                diagnostics["reserve_relative_improvement_reasons"] = "missing_observation"
+                return False, "spectral_observation_unavailable", diagnostics
+            try:
+                primary_spectral = normalized_hessian_diagnostics(
+                    primary.get("hessian", []), primary.get("transform", []), observation.source_points_camera
+                )
+                candidate_spectral = normalized_hessian_diagnostics(
+                    candidate.get("hessian", []), primary.get("transform", []),
+                    observation.source_points_camera, primary_spectral["characteristic_length"],
+                )
+            except (ValueError, TypeError, AttributeError, np.linalg.LinAlgError):
+                diagnostics["reserve_relative_improvement_reasons"] = "spectral_normalization_failed"
+                return False, "spectral_normalization_failed", diagnostics
+            primary = dict(primary, eigenvalues=primary_spectral["eigenvalues"],
+                           condition_number=primary_spectral["condition_number"])
+            candidate = dict(candidate, eigenvalues=candidate_spectral["eigenvalues"],
+                             condition_number=candidate_spectral["condition_number"])
+            diagnostics["reserve_spectral_length"] = float(primary_spectral["characteristic_length"])
+            for name, spectral in (("primary", primary_spectral), ("candidate", candidate_spectral)):
+                diagnostics[f"reserve_spectral_{name}_lambda"] = float(spectral["eigenvalues"][0])
+                diagnostics[f"reserve_spectral_{name}_condition"] = float(spectral["condition_number"])
         if not self.accept_only_if:
             return True, "relative_rules_not_configured", diagnostics
         try:

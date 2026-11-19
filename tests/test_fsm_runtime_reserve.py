@@ -21,6 +21,7 @@ from utils.fsm_correspondence_weak import (
     adaptive_weak_subspace,
     correspondence_aware_weak_scores,
     correspondence_probability,
+    normalized_hessian_diagnostics,
     organized_depth_source_normals,
 )
 
@@ -66,6 +67,8 @@ def test_tile_depth_voxel_caps_are_deterministic():
 
 def make_runtime_reserve(trigger=None, accept_only_if=None, policy="reject"):
     reserve = RuntimeObservableReserve.__new__(RuntimeObservableReserve)
+    reserve.spectral_coordinates = "world_raw"
+    reserve.attempt_without_selection = False
     reserve.trigger = trigger or {}
     reserve.accept_only_if = accept_only_if or {}
     reserve.relative_unavailable_policy = policy
@@ -174,7 +177,7 @@ def test_information_v3_missing_refinement_fails_closed_without_gt_fields():
     )
     assert not accepted
     assert reason == "information_v3_refinement_translation|information_v3_refinement_rotation"
-    assert not any("gt" in key.lower() for key in diagnostics)
+    assert not any("gt" in key.lower().split("_") or "ground_truth" in key.lower() for key in diagnostics)
 
 
 def test_information_v3_summary_counts_branches_adoptions_rejections_and_reasons():
@@ -291,7 +294,7 @@ def test_information_v4_joint_metrics_fail_closed_and_decision_is_gt_free():
         _v3_result(100.0, 1.0), _v3_result(98.0, 1.02), dict(metrics, unrelated_gt_error=999.0)
     )
     assert first[:2] == second[:2] == (False, "information_v4_joint_metrics_unavailable")
-    assert not any("gt" in key.lower() for key in first[2])
+    assert not any("gt" in key.lower().split("_") or "ground_truth" in key.lower() for key in first[2])
 
 
 def test_information_v4_neither_still_reports_prospective_global_diagnostics():
@@ -365,6 +368,20 @@ def test_relative_se3_log_roundtrip_and_near_pi(twist):
     result = relative_se3_log(np.eye(4), candidate)
     np.testing.assert_allclose(_exp_se3(result["twist"]), candidate, atol=2e-8)
     assert result["translation_norm_m"] == pytest.approx(np.linalg.norm(result["twist"][3:]))
+
+
+def test_relative_se3_log_projects_small_rotation_drift_but_rejects_large_defect():
+    candidate = np.eye(4)
+    candidate[:3, :3] = np.array([
+        [1.0, 2e-6, 0.0],
+        [-1e-6, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    result = relative_se3_log(np.eye(4), candidate)
+    assert np.all(np.isfinite(result["twist"]))
+    candidate[:3, :3] = np.diag([1.0, 1.0, 0.5])
+    with pytest.raises(ValueError, match="too far from SO\\(3\\)"):
+        relative_se3_log(np.eye(4), candidate)
 
 
 def test_common_target_pose_evaluation_distinguishes_good_and_bad_pose():
@@ -613,7 +630,13 @@ def test_relative_improvement_summary_counts_are_explicit():
 
 def test_empty_metrics_are_explicitly_auditable():
     metrics = RuntimeObservableReserve.empty_metrics("active", "unavailable")
-    assert set(metrics).issubset(STRICT_FRAME_METRIC_FIELDS)
+    spectral_fields = {
+        "reserve_spectral_coordinates", "reserve_spectral_length",
+        "reserve_spectral_primary_lambda", "reserve_spectral_candidate_lambda",
+        "reserve_spectral_primary_condition", "reserve_spectral_candidate_condition",
+    }
+    assert spectral_fields.issubset(metrics)
+    assert (set(metrics) - spectral_fields).issubset(STRICT_FRAME_METRIC_FIELDS)
     for key in (
         "reserve_primary_accepted", "reserve_tracking_accepted", "reserve_consistency_accepted",
         "reserve_relative_improvement_accepted", "reserve_adoption_reason",
@@ -998,3 +1021,195 @@ def test_corr_weak_scores_only_visible_and_has_no_gt_parameters():
     )
     assert scores[0] == 0.0
     assert np.all(np.isfinite(scores))
+
+
+def _spectral_observation():
+    depth, _, points = _organized_plane()
+    ids = np.array([40, 41, 49, 31])
+    return RuntimeReserveObservation(points[ids], ids, depth, _Tree(points[ids]), np.array([1, 2]))
+
+
+def _spectral_result(hessian, pose=None):
+    return {
+        "transform": np.eye(4) if pose is None else pose,
+        "hessian": hessian,
+        "condition_number": 1.0,
+        "effective_rank": 6,
+        "eigenvalues": np.ones(6),
+        "num_correspondences": 12,
+    }
+
+
+@pytest.mark.parametrize("trigger, expected", [
+    ({"condition_number": 10.0}, ["condition_number"]),
+    ({"normalized_lambda_min": 0.01}, ["normalized_lambda_min"]),
+    ({"effective_rank_below": 6}, ["effective_rank_below"]),
+])
+def test_normalized_trigger_invariant_to_world_coordinate_reexpression(trigger, expected):
+    reserve = make_runtime_reserve(trigger=trigger)
+    reserve.spectral_coordinates = "primary_camera_depth"
+    hessian = np.diag([0.0 if "effective_rank_below" in trigger else 0.01, 2, 3, 4, 5, 6])
+    observation = _spectral_observation()
+    world_change = _exp_se3([0.2, -0.1, 0.3, 2.0, -1.0, 3.0])
+    inverse_adjoint = np.linalg.inv(_adjoint(world_change))
+    reexpressed = inverse_adjoint.T @ hessian @ inverse_adjoint
+    first = reserve._trigger(_spectral_result(hessian), observation)
+    second = reserve._trigger(_spectral_result(reexpressed, world_change), observation)
+    assert first == second == (True, expected, None)
+
+
+@pytest.mark.parametrize("accept_only_if", [
+    {}, {"mode": "all", "condition_ratio": 0.98, "lambda_ratio": 1.02},
+])
+def test_normalized_adoption_shared_primary_frame_invariant_and_does_not_mutate(accept_only_if):
+    reserve = make_runtime_reserve(accept_only_if=accept_only_if)
+    reserve.spectral_coordinates = "primary_camera_depth"
+    observation = _spectral_observation()
+    primary = _spectral_result(np.diag([0.01, 2, 3, 4, 5, 6]))
+    candidate = _spectral_result(np.diag([0.02, 2, 3, 4, 5, 6]),
+                                 _exp_se3([0.3, 0.1, -0.2, 0.4, 0.2, -0.1]))
+    first = reserve.evaluate_improvement(primary, candidate, observation=observation)
+    assert first[0]
+    assert primary["condition_number"] == candidate["condition_number"] == 1.0
+    np.testing.assert_array_equal(primary["eigenvalues"], np.ones(6))
+    world_change = _exp_se3([0.2, -0.1, 0.3, 2.0, -1.0, 3.0])
+    inverse_adjoint = np.linalg.inv(_adjoint(world_change))
+    changed = [dict(result, transform=world_change @ result["transform"],
+                    hessian=inverse_adjoint.T @ result["hessian"] @ inverse_adjoint)
+               for result in (primary, candidate)]
+    second = reserve.evaluate_improvement(*changed, observation=observation)
+    assert first[:2] == second[:2]
+    for key in ("reserve_spectral_length", "reserve_spectral_primary_lambda",
+                "reserve_spectral_candidate_lambda", "reserve_spectral_primary_condition",
+                "reserve_spectral_candidate_condition"):
+        assert isinstance(first[2][key], float)
+        assert first[2][key] == pytest.approx(second[2][key])
+    assert first[2]["reserve_spectral_length"] == 2.0
+    assert first[2]["reserve_spectral_candidate_lambda"] == pytest.approx(0.005)
+    assert inspect.signature(reserve.evaluate_improvement).parameters["observation"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+@pytest.mark.parametrize("failure", ["missing_observation", "nonfinite_hessian", "invalid_pose"])
+@pytest.mark.parametrize("accept_only_if", [{}, {"condition_ratio": 0.98}])
+def test_normalized_failures_reject_even_without_rules_or_with_tracking_only(failure, accept_only_if):
+    reserve = make_runtime_reserve(accept_only_if=accept_only_if, policy="tracking_only")
+    reserve.spectral_coordinates = "primary_camera_depth"
+    primary = _spectral_result(np.eye(6))
+    observation = None if failure == "missing_observation" else _spectral_observation()
+    if failure == "nonfinite_hessian":
+        primary["hessian"][0, 0] = np.nan
+    elif failure == "invalid_pose":
+        primary["transform"][0, 0] = 2.0
+    assert not reserve._trigger(primary, observation)[0]
+    assert not reserve.evaluate_improvement(primary, _spectral_result(np.eye(6)), observation=observation)[0]
+
+
+def test_normalized_candidate_nonfinite_hessian_rejects_before_empty_rule_return():
+    reserve = make_runtime_reserve()
+    reserve.spectral_coordinates = "primary_camera_depth"
+    candidate = _spectral_result(np.full((6, 6), np.inf))
+    accepted, reason, _ = reserve.evaluate_improvement(
+        _spectral_result(np.eye(6)), candidate, observation=_spectral_observation()
+    )
+    assert not accepted and reason == "spectral_normalization_failed"
+
+
+def test_normalized_plan_missing_observation_fails_closed_even_for_selection_free_rerun():
+    points = np.array([[0.0, 0.0, 2.0]])
+    reserve = _corr_runtime(points, points, [10], budget=1)
+    reserve.spectral_coordinates = "primary_camera_depth"
+    reserve.candidate_target_mode = "rerun_primary"
+    reserve.attempt_without_selection = True
+    plan = reserve.plan(1, _corr_result(), np.eye(3), 9, 9)
+    assert not plan.metrics["reserve_triggered"]
+    assert plan.metrics["reserve_trigger_unavailable_reason"] == "missing_observation"
+    assert plan.selected_indices.size == 0
+
+
+@pytest.mark.parametrize("coordinates", ["world_raw", "primary_camera_depth"])
+def test_rerun_without_selection_keeps_trigger_and_never_queries(monkeypatch, coordinates):
+    points = np.array([[0.0, 0.0, 2.0]])
+    reserve = _corr_runtime(points, points, [10], budget=1)
+    reserve.spectral_coordinates = coordinates
+    reserve.candidate_target_mode = "rerun_primary"
+    reserve.attempt_without_selection = True
+    reserve.trigger = {"condition_number": 10.0}
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("rerun_primary must bypass query and selection")
+
+    monkeypatch.setattr(reserve.index, "query_local_submap", forbidden)
+    monkeypatch.setattr(reserve, "_corr_scores", forbidden)
+    result = _spectral_result(np.diag([0.01, 2, 3, 4, 5, 6]))
+    result["condition_number"] = 100.0
+    observation = _spectral_observation() if coordinates == "primary_camera_depth" else None
+    plan = reserve.plan(1, result, np.eye(3), 9, 9, observation=observation)
+    assert plan.metrics["reserve_triggered"]
+    assert plan.selected_indices.size == 0
+    assert plan.metrics["reserve_visible"] == plan.metrics["reserve_selected"] == 0
+    reserve.trigger = {"condition_number": 1e10}
+    assert not reserve.plan(1, result, np.eye(3), 9, 9, observation=observation).metrics["reserve_triggered"]
+
+
+@pytest.mark.parametrize("coordinates", ["world_raw", "primary_camera_depth"])
+def test_plan_nonfinite_hessian_fails_closed_without_second_eigendecomposition(coordinates):
+    points = np.array([[0.0, 0.0, 2.0]])
+    reserve = _corr_runtime(points, points, [10], budget=1)
+    reserve.spectral_coordinates = coordinates
+    plan = reserve.plan(1, _spectral_result(np.full((6, 6), np.nan)), np.eye(3), 9, 9,
+                        observation=_spectral_observation())
+    assert not plan.metrics["reserve_triggered"]
+    assert plan.metrics["reserve_trigger_unavailable_reason"] == "hessian_unavailable"
+    assert plan.metrics["reserve_primary_lambda_min"] is None
+
+
+def test_normalized_plan_reports_spectrum_but_selector_receives_raw_hessian(monkeypatch):
+    points = np.array([[0.0, 0.0, 2.0]])
+    reserve = _corr_runtime(points, np.array([[0.0, 0.0, 1.0]]), [10], budget=1)
+    reserve.spectral_coordinates = "primary_camera_depth"
+    reserve.selection = "runtime_weak"
+    reserve.trigger = {"condition_number": 10.0}
+    result = _spectral_result(np.diag([0.01, 2, 3, 4, 5, 6]))
+    observation = _spectral_observation()
+
+    def selector(means, normals, pose, hessian, *args, **kwargs):
+        np.testing.assert_array_equal(hessian, result["hessian"])
+        return np.ones(1), None, None
+
+    monkeypatch.setattr("utils.fsm_runtime_reserve.runtime_weak_scores", selector)
+    plan = reserve.plan(1, result, np.eye(3), 9, 9, observation=observation)
+    expected = normalized_hessian_diagnostics(result["hessian"], result["transform"], observation.source_points_camera)
+    assert plan.selected_indices.tolist() == [0]
+    assert plan.metrics["reserve_spectral_coordinates"] == "primary_camera_depth"
+    assert plan.metrics["reserve_primary_condition"] == expected["condition_number"]
+    assert plan.metrics["reserve_primary_lambda_min"] == expected["eigenvalues"][0]
+    assert plan.metrics["reserve_spectral_length"] == 2.0
+
+
+def test_spectral_config_validates_before_inactive_return(tmp_path):
+    def create(cfg):
+        return RuntimeObservableReserve({"observable_reserve": cfg}, {}, str(tmp_path / "map.npz"),
+                                        None, "baseline", "unused")
+
+    baseline = create({})
+    assert baseline.spectral_coordinates == "world_raw"
+    assert baseline.attempt_without_selection is False
+    configured = create({"spectral_coordinates": "primary_camera_depth",
+                         "candidate_target_mode": "rerun_primary", "attempt_without_selection": True})
+    assert configured.spectral_coordinates == "primary_camera_depth"
+    assert configured.attempt_without_selection is True
+    for cfg, message in (
+        ({"spectral_coordinates": "camera"}, "spectral_coordinates"),
+        ({"attempt_without_selection": 1}, "boolean"),
+        ({"attempt_without_selection": True}, "requires rerun_primary"),
+        ({"attempt_without_selection": True, "candidate_target_mode": "replace"}, "requires rerun_primary"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            create(cfg)
+
+
+def test_world_raw_default_keeps_reported_metrics_and_accepts_empty_rules_without_observation():
+    reserve = make_runtime_reserve(trigger={"condition_number": 10.0})
+    result = _spectral_result(np.diag([0.01, 2, 3, 4, 5, 6]))
+    assert reserve._trigger(result) == (False, [], None)
+    assert reserve.evaluate_improvement({}, {})[:2] == (True, "relative_rules_not_configured")

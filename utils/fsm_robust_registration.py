@@ -337,6 +337,25 @@ def register_robust_point_to_plane(
             initial_mean_robust_cost = current_cost / source_indices.size
 
         diagonal = np.maximum(np.diag(hessian), 1e-12)
+        # Use the undamped gradient: large LM damping can make any step tiny.
+        stationary = bool(
+            np.isfinite(current_cost)
+            and np.all(np.isfinite(hessian))
+            and np.all(np.isfinite(gradient))
+            and np.max(np.abs(gradient) / np.sqrt(diagonal))
+            <= np.sqrt(np.finfo(np.float64).eps) * max(1.0, np.sqrt(2.0 * current_cost))
+        )
+        if stationary:
+            iterations = iteration + 1
+            final_step_rotation_deg = 0.0
+            final_step_translation_m = 0.0
+            last_relative_reduction = 0.0
+            convergence_streak += 1
+            if iterations >= min_iterations and convergence_streak >= convergence_patience:
+                converged = True
+                termination_reason = "converged"
+                break
+            continue
         accepted = False
         step = np.zeros(6, dtype=np.float64)
         candidate_cost = current_cost
@@ -379,6 +398,9 @@ def register_robust_point_to_plane(
             final_step_rotation_deg <= rotation_step_tolerance_deg
             and final_step_translation_m <= translation_step_tolerance_m
             and relative_reduction <= relative_cost_tolerance
+            and np.linalg.norm(gradient[:3] / diagonal[:3])
+            <= np.radians(rotation_step_tolerance_deg)
+            and np.linalg.norm(gradient[3:] / diagonal[3:]) <= translation_step_tolerance_m
         )
         convergence_streak = convergence_streak + 1 if meets_stop else 0
         if iterations >= min_iterations and convergence_streak >= convergence_patience:

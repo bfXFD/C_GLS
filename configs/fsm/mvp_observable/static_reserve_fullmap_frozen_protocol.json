@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "status": "frozen_before_static_reserve_fullmap_localization",
+  "scenes": ["replica_room2_0", "replica_office0_0", "tum_freiburg3_long_office_household"],
+  "arms": ["compact", "corrweak128", "static4096", "full"],
+  "static_map_semantics": "The entire 4096-Gaussian reserve is permanently eligible in the global map and competes with base points under the unchanged 10000-point local coverage cap.",
+  "source_query_cap": 10000,
+  "static_local_target_cap": 10000,
+  "corrweak_candidate_target_cap": 10128,
+  "corrweak_budget": 128,
+  "evaluation_protocol": "mvp_strict",
+  "first_pose_protocol": "gt_first_frame",
+  "motion_model": "constant_velocity",
+  "uses_gt_current_frame_initialization": false,
+  "uses_gt_fallback": false,
+  "final_target_oracle": false,
+  "reporting_rule": "Report all three scenes and all four arms with common-frame accuracy, completeness, latency, peak RSS, map count, and serialized size.",
+  "selection_rule": "No target cap, trigger, V4, or scene-specific parameter changes after viewing results."
+}

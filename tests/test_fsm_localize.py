@@ -77,6 +77,50 @@ def make_frames(points, num_frames=3):
     return frames
 
 
+def test_strict_first_pose_applies_left_twist_to_gt_pose():
+    gt = np.eye(4, dtype=np.float64)
+    pose = fsm_localize._strict_first_pose(
+        "gt_first_frame", gt, None, np.array([0.0, 0.0, 0.0, 0.1, -0.2, 0.3])
+    )
+    np.testing.assert_allclose(pose[:3, 3], [0.1, -0.2, 0.3])
+
+
+def test_candidate_target_replace_preserves_budget_and_is_deterministic():
+    base = np.arange(30, dtype=np.float64).reshape(10, 3)
+    base_cov = np.tile(np.eye(3), (10, 1, 1))
+    base_normals = np.tile([0.0, 0.0, 1.0], (10, 1))
+    reserve = np.arange(9, dtype=np.float64).reshape(3, 3) + 100.0
+    reserve_cov = np.tile(2.0 * np.eye(3), (3, 1, 1))
+    reserve_normals = np.tile([1.0, 0.0, 0.0], (3, 1))
+    kwargs = dict(
+        mode="replace", base_points=base, base_covariances=base_cov,
+        base_normals=base_normals, base_global_ids=np.arange(10),
+        reserve_points=reserve, reserve_covariances=reserve_cov,
+        reserve_normals=reserve_normals, replacement_seed=7,
+    )
+    first = fsm_localize._candidate_target_arrays(**kwargs)
+    second = fsm_localize._candidate_target_arrays(**kwargs)
+    assert first[0].shape == base.shape
+    assert first[3] == reserve.shape[0]
+    np.testing.assert_array_equal(first[0], second[0])
+    np.testing.assert_array_equal(first[2][-3:], reserve_normals)
+
+
+def test_candidate_target_rerun_primary_ignores_reserve():
+    base = np.arange(12, dtype=np.float64).reshape(4, 3)
+    normals = np.tile([0.0, 0.0, 1.0], (4, 1))
+    points, covariances, result_normals, removed = fsm_localize._candidate_target_arrays(
+        mode="rerun_primary", base_points=base, base_covariances=None,
+        base_normals=normals, base_global_ids=np.arange(4),
+        reserve_points=np.ones((2, 3)), reserve_covariances=None,
+        reserve_normals=np.tile([1.0, 0.0, 0.0], (2, 1)), replacement_seed=0,
+    )
+    np.testing.assert_array_equal(points, base)
+    np.testing.assert_array_equal(result_normals, normals)
+    assert covariances is None
+    assert removed == 0
+
+
 def test_reserve_selection_event_writer_streams_bounded_rows(tmp_path):
     map_path, _ = make_fake_map(tmp_path)
     geometry_path = tmp_path / "geometry.npz"

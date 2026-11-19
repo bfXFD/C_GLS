@@ -112,6 +112,21 @@ def test_cap_is_stable_by_score_then_index_or_depth_then_index():
     np.testing.assert_array_equal(score_result["indices"], [1, 2])
 
 
+def test_spatial_representatives_preserve_quota_and_are_order_independent():
+    config = LocalSubmapConfig(near=0.5, far=5., max_points=4, sampling_policy="coverage",
+                               tile_rows=1, tile_cols=1, depth_bins=1,
+                               coverage_representatives="spatial_strata")
+    ids = np.arange(16)
+    u = np.repeat([2., 20., 40., 60.], 4)
+    v = np.full(16, 5.)
+    z = np.full(16, 2.)
+    selected, _ = MapSpatialIndex._coverage_sample(ids, u, v, z, 80, 80, config, None)
+    reordered, _ = MapSpatialIndex._coverage_sample(ids[::-1], u[::-1], v[::-1], z[::-1],
+                                                    80, 80, config, np.arange(16))
+    np.testing.assert_array_equal(selected, [0, 4, 8, 12])
+    np.testing.assert_array_equal(selected, reordered)
+
+
 def test_coverage_cap_preserves_tiles_depth_and_is_order_deterministic(monkeypatch):
     points = np.stack([
         point_at_pixel(1.0, 1.0, 0.6),

@@ -84,6 +84,20 @@ def test_tum_pose_thresholds_are_explicit_and_not_tighter_than_replica():
         assert tum_limits["rotation_deg"] >= replica_limits["rotation_deg"]
 
 
+def test_reviewer_ablation_modes_are_explicit_and_budget_32_is_supported():
+    common = SourceFileLoader("review_common", str(CONFIG_DIR / "common.py")).load_module()
+    replace = common.make_reviewer_ablation(
+        "replica", "room2", budget=32, target_mode="replace", normal_mode="frozen_concat"
+    )
+    reserve = replace["observable_reserve"]
+    assert reserve["budget"] == 32
+    assert reserve["candidate_target_mode"] == "replace"
+    assert reserve["candidate_normal_mode"] == "frozen_concat"
+    assert reserve["accept_only_if"]["protocol"] == "branch_aware_information_v4"
+    no_v4 = common.make_reviewer_ablation("tum", "freiburg3_long_office_household", use_v4=False)
+    assert no_v4["observable_reserve"]["accept_only_if"] == {}
+
+
 def test_load_dataset_from_config_accepts_thin_config(tmp_path, monkeypatch):
     path, _ = load_config("replica_room1")
     captured = {}

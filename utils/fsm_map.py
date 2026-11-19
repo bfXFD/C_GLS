@@ -20,6 +20,7 @@ REQUIRED_FSM_FIELDS = (
     "source_params_path",
 )
 ACTIVATION_GEOMETRY_SCHEMA_VERSION = 2
+RUNTIME_RESERVE_SCHEMA_VERSION = 3
 ACTIVATION_GEOMETRY_COMPATIBLE_SCHEMA_VERSIONS = (1, 2)
 ACTIVATION_GEOMETRY_ID_SPACE = "source_params_global"
 REQUIRED_ACTIVATION_GEOMETRY_FIELDS = (
@@ -256,6 +257,83 @@ def load_activation_geometry(
         selection_controls_sha256=selection_controls_sha256,
     )
     return geometry
+
+
+_RUNTIME_RESERVE_ARRAYS = {
+    "reserve_means": (3,), "reserve_normals": (3,), "reserve_scores": (),
+    "reserve_covariances": (3, 3),
+}
+_RUNTIME_RESERVE_METADATA = (
+    "id_space", "map_selected_ids_sha256", "source_params_sha256", "selection_controls_sha256",
+    "reserve_count", "reserve_normal_source",
+)
+
+
+def _validate_runtime_reserve(geometry: dict[str, Any], fsm_map: dict[str, Any]) -> None:
+    version = np.asarray(geometry["schema_version"])
+    if version.shape != () or version.dtype.kind not in "iu" or int(version) != RUNTIME_RESERVE_SCHEMA_VERSION:
+        raise ValueError("Invalid runtime reserve schema version")
+    if _scalar_string(geometry["id_space"], "id_space") != ACTIVATION_GEOMETRY_ID_SPACE:
+        raise ValueError("Invalid runtime reserve ID space")
+    indices = np.asarray(fsm_map["indices"])
+    if selected_ids_sha256(indices) != _scalar_string(geometry["map_selected_ids_sha256"], "map_selected_ids_sha256"):
+        raise ValueError("Runtime reserve does not match main map indices and order")
+    for key in ("source_params_sha256", "selection_controls_sha256"):
+        digest = _scalar_string(geometry[key], key)
+        if (len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest.lower())
+                or digest != _scalar_string(fsm_map[key], key)):
+            raise ValueError(f"Runtime reserve {key} does not match main map")
+    ids = _global_ids(geometry, "reserve_global_ids")
+    if np.isin(ids, indices).any():
+        raise ValueError("Runtime reserve overlaps main map")
+    count = np.asarray(geometry["reserve_count"])
+    if count.shape != () or count.dtype.kind not in "iu" or int(count) != len(ids):
+        raise ValueError("Runtime reserve count does not match its IDs")
+    _scalar_string(geometry["reserve_normal_source"], "reserve_normal_source")
+    for key, shape in _RUNTIME_RESERVE_ARRAYS.items():
+        values = np.asarray(geometry[key])
+        if values.shape != (len(ids), *shape) or values.dtype.kind != "f" or not np.isfinite(values).all():
+            raise ValueError(f"Invalid runtime reserve field: {key}")
+    covariances = np.asarray(geometry["reserve_covariances"], dtype=np.float64)
+    if (not np.allclose(covariances, covariances.transpose(0, 2, 1), atol=1e-5)
+            or np.any(np.linalg.eigvalsh(covariances) <= 0)):
+        raise ValueError("Runtime reserve covariances must be symmetric positive definite")
+    if "reserve_supported" in geometry:
+        supported = np.asarray(geometry["reserve_supported"])
+        if supported.dtype.kind != "b" or supported.shape != (len(ids),):
+            raise ValueError("Invalid runtime reserve support mask")
+
+
+def load_runtime_reserve_geometry(path: str, fsm_map: dict[str, Any]) -> dict[str, Any] | None:
+    """Load a runtime-only sidecar or the historical complete activation archive."""
+    with np.load(path, allow_pickle=False) as archive:
+        version = int(np.asarray(archive["schema_version"])) if "schema_version" in archive else 0
+        if version == RUNTIME_RESERVE_SCHEMA_VERSION:
+            geometry = dict(archive)
+            _validate_runtime_reserve(geometry, fsm_map)
+            return geometry
+    if version < 2:
+        return None
+    return load_activation_geometry(
+        path, fsm_map, source_params_sha256=str(np.asarray(fsm_map["source_params_sha256"])),
+        selection_controls_sha256=str(np.asarray(fsm_map["selection_controls_sha256"])),
+    )
+
+
+def export_runtime_reserve_geometry(source: str, fsm_map: dict[str, Any], output: str) -> None:
+    """Derive an exact-geometry deployment sidecar without rewriting the audit archive."""
+    archive = load_activation_geometry(source, fsm_map)
+    if int(archive["schema_version"]) < 2:
+        raise ValueError("The audit archive does not contain a reserve")
+    geometry = {key: archive[key] for key in (*_RUNTIME_RESERVE_ARRAYS, *_RUNTIME_RESERVE_METADATA, "reserve_global_ids")
+                if key != "reserve_normal_source"}
+    geometry["schema_version"] = np.asarray(RUNTIME_RESERVE_SCHEMA_VERSION, dtype=np.int64)
+    geometry["reserve_normal_source"] = archive.get("reserve_normal_source", np.asarray("sidecar_reserve_normals"))
+    if "reserve_supported" in archive:
+        geometry["reserve_supported"] = np.asarray(archive["reserve_supported"], dtype=bool)
+    _validate_runtime_reserve(geometry, fsm_map)
+    with open(output, "xb") as stream:
+        np.savez_compressed(stream, **geometry)
 
 
 def fsm_map_field_sizes(fsm_map: dict[str, Any]) -> dict[str, int]:

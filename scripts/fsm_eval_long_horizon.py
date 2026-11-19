@@ -21,7 +21,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from scripts.fsm_localize import load_config, run_localization
-from utils.fsm_dataset import load_dataset_from_config
+from utils.fsm_dataset import dataset_pose_provenance, load_dataset_from_config
 
 
 FROZEN_AUDIT_DIRNAME = "audit_v2_full_rerun"
@@ -38,6 +38,8 @@ RUNTIME_SOURCE_PATHS = (
     "utils/fsm_metrics.py",
     "utils/fsm_activation_diagnostics.py",
     "utils/fsm_runtime_memory.py",
+    "utils/fsm_dataset.py",
+    "datasets/gradslam_datasets/tum.py",
 )
 SUMMARY_FIELDS = [
     "dataset",
@@ -398,12 +400,15 @@ def validate_case(case: dict[str, Any], default_start: int | None, default_end: 
     if not isinstance(metrics, dict) or any(not metrics.get(key) for key in required_metrics):
         raise ValueError(f"{case['name']}: long-horizon metric configuration is incomplete")
     dataset = config.get("dataset", config.get("data", {}))
+    pose_provenance = dataset_pose_provenance(config)
     return {
         **case,
         "start": default_start if case.get("start") is None else int(case["start"]),
         "end": default_end if case.get("end") is None else int(case["end"]),
         "dataset": dataset.get("dataset_name", dataset.get("name", "")),
         "sequence": dataset.get("sequence", ""),
+        "pose_reference_sequence": dataset.get("pose_reference_sequence"),
+        "pose_provenance": pose_provenance,
         "evaluation_protocol": evaluation_protocol,
         "first_pose_protocol": first_pose,
         "uses_gt_first_pose": first_pose == "gt_first_frame",
@@ -542,6 +547,7 @@ def _case_provenance(case: dict[str, Any]) -> dict[str, Any]:
         "final_target_oracle_enabled": bool(oracle_cfg.get("enabled", False)),
         "final_target_oracle_config_sha256": _resolved_config_sha256(oracle_cfg),
         "runtime_source_sha256": _runtime_source_sha256(),
+        "dataset_pose_provenance": case.get("pose_provenance"),
         "offline_gt_scorer_sha256": _file_record(str(BASE_DIR / "scripts/fsm_score_paired_reserve_gt.py"))["sha256"],
         "git_head": git_head,
         "dirty": dirty,
@@ -721,6 +727,7 @@ def run_plan(plan: dict[str, Any], skip_existing: bool = False) -> list[dict[str
                     "enabled": bool(case["config_object"].get("final_target_oracle", {}).get("enabled", False)),
                     "config_sha256": _resolved_config_sha256(case["config_object"].get("final_target_oracle", {}) or {}),
                 },
+                "dataset_pose_provenance": case.get("pose_provenance"),
             }
         )
     manifest = {

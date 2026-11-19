@@ -19,6 +19,7 @@ from utils.fsm_correspondence_weak import (
     adaptive_weak_subspace,
     correspondence_aware_weak_scores,
     correspondence_probability,
+    normalized_hessian_diagnostics,
     organized_depth_source_normals,
 )
 from utils.fsm_runtime_reserve import (
@@ -554,13 +555,15 @@ class PairedShadowReserve:
                     weak = self._weak_subspace(snapshot)
                     length = float(weak["characteristic_length"])
                     primary_h = np.asarray(weak["normalized_hessian"], dtype=np.float64)
-                    augmented_h = _normalized_diagnostic_hessian(fixed, length)
+                    augmented_h = _normalized_diagnostic_hessian(fixed, length, snapshot.primary_pose)
                     reserve_h, actual_flags, actual_count, actual_unique = _actual_reserve_hessian(
-                        fixed, selected, length
+                        fixed, selected, length, snapshot.primary_pose
                     )
                     primary_raw_h = _psd(snapshot.primary_hessian)
                     augmented_raw_h = _psd(np.asarray(fixed.get("hessian"), dtype=np.float64))
-                    reserve_raw_h, _, _, _ = _actual_reserve_hessian(fixed, selected, None)
+                    reserve_raw_h, _, _, _ = _actual_reserve_hessian(
+                        fixed, selected, None, snapshot.primary_pose
+                    )
                     _add_hessian_metrics(row, "primary_h", primary_raw_h)
                     _add_hessian_metrics(row, "augmented_h", augmented_raw_h)
                     _add_hessian_metrics(row, "actual_reserve_h", reserve_raw_h)
@@ -786,19 +789,25 @@ def _pose_hash(value: Any) -> str:
     return hashlib.sha256(np.ascontiguousarray(pose).tobytes()).hexdigest()
 
 
-def _normalized_diagnostic_hessian(result: dict[str, Any], length: float) -> np.ndarray:
+def _normalized_diagnostic_hessian(
+    result: dict[str, Any], length: float, reference_pose: np.ndarray,
+) -> np.ndarray:
+    """Map world-left diagnostic rows to the primary's normalized camera frame."""
     jacobians = np.asarray(result.get("jacobians", np.empty((0, 6))), dtype=np.float64)
     weights = np.asarray(result.get("weights", np.ones(jacobians.shape[0])), dtype=np.float64)
     if jacobians.ndim != 2 or jacobians.shape[1] != 6 or weights.shape != (jacobians.shape[0],):
         raise ValueError("fixed diagnostics must provide aligned jacobians and weights")
-    normalized = jacobians.copy()
-    normalized[:, :3] /= length
-    return _psd((normalized.T * weights) @ normalized)
+    hessian_world = (jacobians.T * weights) @ jacobians
+    return _psd(normalized_hessian_diagnostics(
+        hessian_world, reference_pose, characteristic_length=length,
+    )["hessian"])
 
 
 def _actual_reserve_hessian(
     result: dict[str, Any], selected_ids: np.ndarray, length: float | None,
+    reference_pose: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Sum selected world-left rows, optionally in the shared normalized frame."""
     target_ids = np.asarray(result.get("target_ids", np.empty(0, dtype=np.int64)), dtype=np.int64)
     jacobians = np.asarray(result.get("jacobians", np.empty((0, 6))), dtype=np.float64)
     weights = np.asarray(result.get("weights", np.ones(jacobians.shape[0])), dtype=np.float64)
@@ -806,9 +815,12 @@ def _actual_reserve_hessian(
         raise ValueError("augmented fixed correspondence IDs, jacobians and weights must align")
     mask = np.isin(target_ids, selected_ids)
     rows = jacobians[mask].copy()
-    if length is not None:
-        rows[:, :3] /= length
-    hessian = _psd((rows.T * weights[mask]) @ rows)
+    hessian = (
+        _psd((rows.T * weights[mask]) @ rows) if length is None
+        else _normalized_diagnostic_hessian(
+            {"jacobians": rows, "weights": weights[mask]}, length, reference_pose,
+        )
+    )
     matched = np.unique(target_ids[mask])
     flags = np.isin(selected_ids, matched)
     return hessian, flags, int(np.count_nonzero(mask)), int(matched.size)

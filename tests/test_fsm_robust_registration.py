@@ -1,4 +1,7 @@
 import numpy as np
+import pytest
+
+import utils.fsm_robust_registration as registration
 
 from utils.fsm_robust_registration import (
     aggregate_correspondence_hessian,
@@ -88,6 +91,97 @@ def test_recovers_known_small_transform():
     assert transform_error(result["transform"], truth) < 2e-3
 
 
+@pytest.mark.parametrize("loss", ["none", "huber", "cauchy"])
+def test_zero_residual_full_rank_warm_start_converges(loss):
+    target, normals = make_three_plane_scene()
+    warm_start = se3_exp(np.array([0.0, 0.0, 0.0, 0.025, -0.018, 0.02]))
+    source = target - warm_start[:3, 3]
+    result = register_robust_point_to_plane(
+        source,
+        target,
+        init_transform=warm_start,
+        target_normals=normals,
+        loss=loss,
+        min_iterations=3,
+        convergence_patience=2,
+    )
+    assert result["converged"]
+    assert result["optimizer_valid"]
+    assert result["failure_reason"] is None
+    assert result["termination_reason"] == "converged"
+    assert result["effective_rank"] == 6
+    assert result["iterations"] == 3
+    assert result["accepted_step_count"] == 0
+    assert result["rejected_lm_trials"] == 0
+    assert result["final_mean_robust_cost"] == 0.0
+    assert result["final_step_rotation_deg"] == 0.0
+    assert result["final_step_translation_m"] == 0.0
+    assert result["last_relative_reduction"] == 0.0
+    np.testing.assert_array_equal(result["transform"], warm_start)
+
+
+def test_near_stationary_nonzero_residual_converges_without_moving():
+    rng = np.random.default_rng(42)
+    target = rng.normal(size=(100, 3))
+    normals = rng.normal(size=target.shape)
+    normals /= np.linalg.norm(normals, axis=1, keepdims=True)
+    _, jacobian = point_to_plane_residual_jacobian(target, target, normals)
+    residuals = rng.normal(scale=1e-3, size=target.shape[0])
+    residuals -= jacobian @ np.linalg.lstsq(jacobian, residuals, rcond=None)[0]
+    source = target + residuals[:, None] * normals + np.array([1e-12, 0.0, 0.0])
+    result = register_robust_point_to_plane(
+        source, target, target_normals=normals, loss="none"
+    )
+    assert result["converged"]
+    assert result["optimizer_valid"]
+    assert result["failure_reason"] is None
+    assert result["effective_rank"] == 6
+    assert result["final_mean_robust_cost"] > 0.0
+    assert 0.0 < np.linalg.norm(result["gradient"]) < 1e-9
+    assert result["accepted_step_count"] == 0
+    assert result["rejected_lm_trials"] == 0
+    np.testing.assert_array_equal(result["transform"], np.eye(4))
+
+
+def test_nonstationary_rejected_trials_remain_invalid(monkeypatch):
+    target, normals = make_three_plane_scene()
+    source = target + np.array([0.01, -0.01, 0.01])
+    monkeypatch.setattr(registration, "_robust_cost", lambda *args: 1.0)
+    result = register_robust_point_to_plane(
+        source, target, target_normals=normals, lm_damping=1e12, loss="none"
+    )
+    assert not result["converged"]
+    assert not result["optimizer_valid"]
+    assert result["effective_rank"] == 6
+    assert result["failure_reason"] == "lm_step_rejected"
+    assert result["termination_reason"] == "lm_step_rejected"
+    assert result["accepted_step_count"] == 0
+    assert result["rejected_lm_trials"] == 10
+    assert np.linalg.norm(result["gradient"]) > 0.1
+    np.testing.assert_array_equal(result["transform"], np.eye(4))
+
+
+def test_large_damping_small_accepted_steps_do_not_imply_convergence():
+    target, normals = make_three_plane_scene()
+    source = target + np.array([0.01, -0.01, 0.01])
+    result = register_robust_point_to_plane(
+        source,
+        target,
+        target_normals=normals,
+        lm_damping=1e12,
+        max_iterations=2,
+        loss="none",
+    )
+    assert result["accepted_step_count"] == 2
+    assert result["final_step_rotation_deg"] < 0.01
+    assert result["final_step_translation_m"] < 1e-4
+    assert result["last_relative_reduction"] < 1e-5
+    assert np.linalg.norm(result["gradient"]) > 0.1
+    assert not result["converged"]
+    assert result["optimizer_valid"]
+    assert result["termination_reason"] == "max_iterations"
+
+
 def test_cauchy_is_more_robust_to_outliers_than_none():
     rng = np.random.default_rng(23)
     target, normals = make_three_plane_scene(grid_size=11)
@@ -125,6 +219,8 @@ def test_single_plane_reports_degeneracy():
     )
     assert not result["converged"]
     assert result["failure_reason"] == "degenerate_geometry"
+    assert result["termination_reason"] == "degenerate_geometry"
+    assert not result["optimizer_valid"]
     assert result["effective_rank"] == 3
     assert np.isinf(result["condition_number"])
     assert not result["pose_covariance_valid"]

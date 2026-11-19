@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "map_sequence": "rgbd_dataset_freiburg1_desk2",
+  "query_sequence": "rgbd_dataset_freiburg1_desk",
+  "pose_frame": "inv(P_map0_abs) @ P_query_abs",
+  "fixed_transform": "A = inv(P_map0_abs) @ P_query0_abs",
+  "first_pose_protocol": "query GT is used once to initialize A and the tracker; subsequent query GT is evaluation-only",
+  "map_construction_query_frame_count": 0,
+  "arm_order": ["full_map", "compact_fps10", "corr_weak128_v4", "replace128_v4"],
+  "splatam_builder": "configs/tum/tum_eval.py with SEED=0 SCENE_NUM=1, executed by scripts/splatam.py from C_GLS_code",
+  "map_export": "fsm_export.py with seed 0 and FPS candidate cap 20000",
+  "reserve_builder": "fsm_build_fixed_map_reserve.py using desk2 params and the desk2 10% FPS base map only",
+  "reserve_count": 4096,
+  "replacement_seed": 0
+}

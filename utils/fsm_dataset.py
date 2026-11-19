@@ -6,6 +6,84 @@ from typing import Any
 import numpy as np
 
 
+def _sha256_file(path: str) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _tum_first_associated_pose(sequence_dir: str) -> np.ndarray:
+    from scipy.spatial.transform import Rotation
+
+    def load_list(name: str, skiprows: int = 0) -> np.ndarray:
+        return np.atleast_2d(np.loadtxt(
+            os.path.join(sequence_dir, name), delimiter=" ", dtype=np.str_,
+            skiprows=skiprows, comments="#",
+        ))
+
+    pose_name = "groundtruth.txt" if os.path.isfile(os.path.join(sequence_dir, "groundtruth.txt")) else "pose.txt"
+    rgb = load_list("rgb.txt")
+    depth = load_list("depth.txt")
+    poses = load_list(pose_name, skiprows=1)
+    rgb_t = rgb[:, 0].astype(np.float64)
+    depth_t = depth[:, 0].astype(np.float64)
+    pose_t = poses[:, 0].astype(np.float64)
+    for timestamp in rgb_t:
+        depth_index = int(np.argmin(np.abs(depth_t - timestamp)))
+        pose_index = int(np.argmin(np.abs(pose_t - timestamp)))
+        if abs(depth_t[depth_index] - timestamp) < 0.08 and abs(pose_t[pose_index] - timestamp) < 0.08:
+            values = poses[pose_index, 1:].astype(np.float64)
+            result = np.eye(4, dtype=np.float64)
+            result[:3, :3] = Rotation.from_quat(values[3:]).as_matrix()
+            result[:3, 3] = values[:3]
+            return result
+    raise ValueError(f"No associated RGB-D/GT frames in {sequence_dir}")
+
+
+def dataset_pose_provenance(config: dict[str, Any]) -> dict[str, Any]:
+    data = config.get("data", config.get("dataset", {}))
+    dataset_name = str(data.get("dataset_name", "")).lower()
+    sequence = data.get("sequence")
+    reference = data.get("pose_reference_sequence")
+    result = {
+        "dataset": dataset_name,
+        "query_sequence": sequence,
+        "pose_reference_sequence": reference,
+        "pose_protocol": "first_query_relative" if reference is None else "frozen_reference_first_pose_v1",
+    }
+    if dataset_name != "tum" or not sequence:
+        return result
+    basedir = data["basedir"]
+    query_dir = os.path.join(basedir, sequence)
+    result["query_sources"] = {
+        name: {"path": os.path.join(query_dir, name), "sha256": _sha256_file(os.path.join(query_dir, name))}
+        for name in ("groundtruth.txt", "rgb.txt", "depth.txt")
+    }
+    if reference is None:
+        return result
+    reference_dir = os.path.join(basedir, reference)
+    map0_abs = _tum_first_associated_pose(reference_dir)
+    query0_abs = _tum_first_associated_pose(query_dir)
+    transform = np.linalg.inv(map0_abs) @ query0_abs
+    result.update(
+        reference_sources={
+            name: {"path": os.path.join(reference_dir, name), "sha256": _sha256_file(os.path.join(reference_dir, name))}
+            for name in ("groundtruth.txt", "rgb.txt", "depth.txt")
+        },
+        map0_abs=map0_abs.tolist(),
+        query0_abs=query0_abs.tolist(),
+        fixed_frame_transform_A=transform.tolist(),
+        transformed_pose_definition="A @ inv(P_query0_abs) @ P_query_abs = inv(P_map0_abs) @ P_query_abs",
+        first_pose_protocol="query GT is used once to initialize A; later query GT is evaluation-only",
+        map_construction_query_frame_count=0,
+    )
+    return result
+
+
 def _squeeze_depth(depth: np.ndarray) -> np.ndarray:
     depth = np.asarray(depth)
     if depth.ndim == 3 and depth.shape[-1] == 1:
@@ -198,7 +276,9 @@ def load_dataset_from_config(config_path: str):
         desired_height=data_config.get("desired_image_height"),
         desired_width=data_config.get("desired_image_width"),
         device=config.get("primary_device", "cpu"),
-        relative_pose=True,
+        relative_pose=data_config.get("relative_pose", True),
+        pose_reference_sequence=data_config.get("pose_reference_sequence"),
         ignore_bad=False,
-        use_train_split=True,
+        use_train_split=data_config.get("use_train_split", True),
+        query_only_map_frame=data_config.get("query_only_map_frame", False),
     )

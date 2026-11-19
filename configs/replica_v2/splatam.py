@@ -7,7 +7,9 @@ scenes = ["room_0", "room_1", "room_2",
 
 primary_device="cuda:0"
 seed = 0
-scene_name = scenes[0]
+scene_name = os.environ.get("SCENE_NAME", scenes[0])
+if scene_name not in scenes:
+    raise ValueError(f"Unknown Replica V2 scene {scene_name!r}")
 
 # SplaTAM
 use_train_split = True
@@ -42,7 +44,7 @@ config = dict(
     checkpoint_time_idx=0,
     save_checkpoints=False, # Save Checkpoints
     checkpoint_interval=100, # Checkpoint Interval
-    use_wandb=True,
+    use_wandb=os.environ.get("WANDB_MODE", "online") != "disabled",
     wandb=dict(
         entity="theairlab",
         project="SplaTAM",

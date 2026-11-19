@@ -316,8 +316,8 @@ def make_tum_core_route(scene, selection, budget, seed=0, mode="active"):
     if mode not in ("plan_only", "active"):
         raise ValueError(f"Unknown reserve mode {mode!r}")
     budget = int(budget)
-    if budget not in (64, 128, 256):
-        raise ValueError("Core-route reserve budget must be 64, 128, or 256")
+    if budget not in (32, 64, 128, 256):
+        raise ValueError("Core-route reserve budget must be 32, 64, 128, or 256")
     config = make_tum_config(scene)
     config["observable_reserve"].update(
         enabled=True,
@@ -343,6 +343,24 @@ def make_tum_paired_core_route(scene, eligible_pool="visible"):
     config["observable_reserve"].update(enabled=False, mode="off")
     config["paired_reserve_evaluation"].update(enabled=True, eligible_pool=eligible_pool)
     return config
+
+
+def restrict_paired_to_corrweak128(config):
+    paired = config["paired_reserve_evaluation"]
+    paired.update(
+        policies=["runtime_corr_weak"],
+        random_seeds=[0],
+        budgets=[128],
+    )
+    return config
+
+
+def make_tum_horizon_paired(scene, eligible_pool="visible"):
+    return restrict_paired_to_corrweak128(make_tum_paired_core_route(scene, eligible_pool))
+
+
+def make_replica_horizon_paired(sequence, eligible_pool="visible"):
+    return restrict_paired_to_corrweak128(make_replica_paired_core_route(sequence, eligible_pool))
 
 
 def make_replica_room0_ablation(kind):
@@ -377,8 +395,8 @@ def make_replica_core_route(sequence, selection, budget, seed=0, mode="active"):
     if mode not in ("plan_only", "active"):
         raise ValueError(f"Unknown reserve mode {mode!r}")
     budget = int(budget)
-    if budget not in (64, 128, 256):
-        raise ValueError("Core-route reserve budget must be 64, 128, or 256")
+    if budget not in (32, 64, 128, 256):
+        raise ValueError("Core-route reserve budget must be 32, 64, 128, or 256")
     seed = int(seed)
     config = make_replica_config(sequence)
     config["observable_reserve"].update(
@@ -471,6 +489,46 @@ def make_replica_core_route_info_v4(sequence, selection, budget, seed=0):
     return apply_information_adoption_v4(
         make_replica_core_route(sequence, selection, budget, seed=seed)
     )
+
+
+def configure_reviewer_ablation(
+    config,
+    *,
+    target_mode="append",
+    normal_mode="augmented_local_pca",
+    use_v4=True,
+    replacement_seed=0,
+    first_pose_twist=None,
+):
+    if target_mode not in ("append", "replace", "rerun_primary"):
+        raise ValueError("target_mode must be append, replace, or rerun_primary")
+    if normal_mode not in ("augmented_local_pca", "frozen_concat"):
+        raise ValueError("normal_mode must be augmented_local_pca or frozen_concat")
+    reserve = config["observable_reserve"]
+    reserve["candidate_target_mode"] = target_mode
+    reserve["candidate_normal_mode"] = normal_mode
+    reserve["replacement_seed"] = int(replacement_seed)
+    if use_v4:
+        apply_information_adoption_v4(config)
+    else:
+        reserve["accept_only_if"] = {}
+        reserve["stability_gate"].update(enabled=False, mode="off")
+    if first_pose_twist is not None:
+        values = [float(value) for value in first_pose_twist]
+        if len(values) != 6:
+            raise ValueError("first_pose_twist must contain [rx, ry, rz, tx, ty, tz]")
+        config["registration"]["first_pose_left_twist"] = values
+    return config
+
+
+def make_reviewer_ablation(dataset, scene, selection="runtime_corr_weak", budget=128, **kwargs):
+    if dataset == "replica":
+        config = make_replica_core_route(scene, selection, budget)
+    elif dataset == "tum":
+        config = make_tum_core_route(scene, selection, budget)
+    else:
+        raise ValueError("dataset must be replica or tum")
+    return configure_reviewer_ablation(config, **kwargs)
 
 
 def make_replica_room0_core_route(selection, budget, seed=0, mode="active"):
